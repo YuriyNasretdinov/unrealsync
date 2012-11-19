@@ -36,6 +36,10 @@ class Unrealsync
         'pipe' => null, // stdout pipe
     );
 
+    var $remotes = array(
+        // srv => array(pp => ..., read_pipe => ..., write_pipe => ...)
+    );
+
     function __construct()
     {
         $this->_setupOS();
@@ -326,8 +330,7 @@ class Unrealsync
         } else {
             throw new UnrealsyncException("Start local watcher for $this->os is not yet implemented, sorry");
         }
-        $devnull = array('file', '/dev/null', 'r');
-        $pp = proc_open($binary, array($devnull, array('pipe', 'w'), $devnull), $pipes);
+        $pp = proc_open($binary, array(array('file', '/dev/null', 'r'), array('pipe', 'w'), STDERR), $pipes);
         if (!$pp) throw new UnrealsyncException("Cannot start local watcher ($binary)");
 
         $this->watcher = array(
@@ -343,8 +346,9 @@ class Unrealsync
         if (!$host = $data['host']) throw new UnrealsyncException("No 'host' entry for '$srv'");
         if (!$dir  = $data['dir']) throw new UnrealsyncException("No 'dir' entry for '$srv'");
         $dir = rtrim($dir, '/');
-        $dir_esc = escapeshellarg($dir);
-        echo "Checking for .unrealsync directory\n";
+        $repo_dir = $dir . '/' . self::REPO;
+        $dir_esc = escapeshellarg($repo_dir);
+        echo "Checking for " . self::REPO . " directory\n";
         $result = $this->ssh($host, "if [ ! -d $dir_esc ]; then exec mkdir $dir_esc; fi; exit 0", $data);
         if ($result === false) throw new UnrealsyncException("Cannot create $dir for '$srv'");
         if (empty($data['os'])) {
@@ -354,8 +358,10 @@ class Unrealsync
         }
         if (!in_array($data['os'], array('Linux', 'Darwin'))) throw new UnrealsyncException("Unsupported remote os '$data[os]' for '$srv'");
         $watcher_path = __DIR__ . '/bin/' . strtolower($data['os']) . '/notify';
-        $result = $this->scp($host, array(__FILE__, $watcher_path), $dir . '/');
+        $result = $this->scp($host, array(__FILE__, $watcher_path), $repo_dir . '/');
         if ($result === false) throw new UnrealsyncException("Cannot scp unrealsync.php and watcher to '$srv'");
+
+
 
         echo "Init sync OK\n";
     }
