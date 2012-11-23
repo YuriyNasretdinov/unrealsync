@@ -44,6 +44,7 @@ class Unrealsync
     const CMD_SHUTDOWN = 'shutdown';
     const CMD_DIFF = 'diff';
     const CMD_PING = 'ping';
+    const CMD_GET_FILES = 'getfiles';
 
     const MAX_MEMORY = 16777216; // max 16 Mb per read
     const MAX_CONFLICTS = 20;
@@ -558,7 +559,7 @@ class Unrealsync
 
         echo "  Getting remote diff from $srv\n";
         $remote_diff = $this->_remoteExecute($srv, self::CMD_DIFF);
-        $this->_applyRemoteDiff($remote_diff);
+        $this->_applyRemoteDiff($srv, $remote_diff);
     }
 
 
@@ -582,7 +583,7 @@ class Unrealsync
     }
 
     /* go through remote diff, apply diff and report about conflicts */
-    private function _applyRemoteDiff($diff)
+    private function _applyRemoteDiff($srv, $diff)
     {
         echo "  Applying remote diff: ";
         $this->_timerStart();
@@ -615,7 +616,7 @@ class Unrealsync
                     $recv_list .= $this->_getSizeFromStat($diffstat) . " $filename\n";
                     continue;
                 }
-                $conflicts .= "Add/add: we already have $filename, but it is different\n";
+                $conflicts .= "Add/add conflict: $filename\n";
                 $conf_list .= $this->_getSizeFromStat($diffstat) . " $filename\n";
             } else if ($op === 'D') {
 
@@ -658,13 +659,163 @@ class Unrealsync
 
         if ($recv_list) {
             $num = substr_count($recv_list, "\n");
-            echo "  Receiving $num files\n";
-            echo $recv_list;
+            echo "  Receiving $num file" . ($num > 1 ? "s" : "") . "\n";
+            $this->_receiveFiles($srv, $recv_list);
         } else {
             echo "  No changes detected\n";
         }
 
         $this->debug("Peak memory: " . memory_get_peak_usage(true));
+    }
+
+    private function _receiveFiles($srv, $recv_list)
+    {
+        $max_requested_size = self::MAX_MEMORY / 2;
+        $queue = "";
+        $offset = 0;
+        $total_size = 0;
+        $big_files = array();
+
+        while (true) {
+            if (($end_pos = mb_orig_strpos($recv_list, "\n", $offset)) === false) break;
+            list($size, $file) = explode(" ", mb_orig_substr($recv_list, $offset, $end_pos - $offset), 2);
+            $offset = $end_pos + 1;
+            if ($size > $max_requested_size) {
+                $big_files[] = $file;
+                continue;
+            }
+
+            if ($total_size + $size > $max_requested_size) {
+                $this->_receiveFilesQueue($srv, $queue);
+                $queue = "";
+            }
+
+            $queue .= "$file\n";
+        }
+
+        if (mb_orig_strlen($queue)) $this->_receiveFilesQueue($srv, $queue);
+        if ($big_files) $this->_receiveBigFiles($srv, $big_files);
+    }
+
+    private function _receiveBigFiles($srv, array $big_files)
+    {
+        foreach ($big_files as $file) {
+            echo "Receiving big file: $file\n";
+            // TODO: do actual receive :))
+        }
+    }
+
+    private function _receiveFilesQueue($srv, $queue)
+    {
+        $response = $this->_remoteExecute($srv, self::CMD_GET_FILES, $queue);
+        $offset = 0;
+        $response_len = mb_orig_strlen($response);
+
+        while ($offset < $response_len) {
+            $filename_len = intval(mb_orig_substr($response, $offset, 10));
+            $offset += 10;
+            $filename = mb_orig_substr($response, $offset, $filename_len);
+            $offset += $filename_len;
+
+            $stat_len = intval(mb_orig_substr($response, $offset, 10));
+            $offset += 10;
+            $stat = mb_orig_substr($response, $offset, $stat_len);
+            $offset += $stat_len;
+
+            $contents = "";
+            if ($this->_getSizeFromStat($stat)) {
+                $contents_len = intval(mb_orig_substr($response, $offset, 10));
+                $offset += 10;
+                $contents = mb_orig_substr($response, $contents_len, 10);
+                $offset += $contents_len;
+            }
+
+            $this->_writeFile($filename, $stat, $contents);
+        }
+    }
+
+    /*
+     * Write file $filename with $stat and $contents to work copy
+     * If $commit = true, then repository is updated as well
+     */
+    private function _writeFile($filename, $stat, $contents, $commit = false)
+    {
+        $old_stat = $this->_stat($filename);
+        if ($stat === "dir") {
+            if ($old_stat === "dir") return true;
+            $this->_removeRecursive($filename);
+            if (!mkdir($filename)) return false;
+        } else if (strpos($stat, "symlink=") === 0) {
+            if (strpos($old_stat, "symlink=") !== 0) $this->_removeRecursive($filename);
+            list(, $lnk) = explode("=", $stat, 2);
+            if (!symlink($lnk, $filename)) return false;
+        } else {
+            if ($this->is_unix) {
+                $tmp = self::REPO_TMP . "/" . basename($filename);
+                if (!file_put_contents($tmp, $contents)) return false;
+                if (!rename($tmp, $filename)) return false;
+            }
+        }
+
+        return $commit ? $this->_commit($filename, $stat) : true;
+    }
+
+    /*
+     * Update repository entry for $filename
+     */
+    private function _commit($filename, $stat = null)
+    {
+        if (!$stat) $stat = $this->_stat($filename);
+        $repof = self::REPO_FILES . "/$filename";
+
+        if ($stat === "dir") {
+            if (!is_dir($repof)) unlink($repof);
+            if (!mkdir($repof)) return false;
+            return true;
+        }
+
+        $tmp = self::REPO_TMP . "/" . basename($filename);
+        if (!file_put_contents($tmp, $stat)) return false;
+        if (!rename($tmp, $repof)) return false;
+        return true;
+    }
+
+    /*
+     * Format:
+     *
+     * <10-byte file name length>
+     * <file name>
+     * <10-byte stat length>
+     * <file stat>
+     * [
+     * (sent only if stat contains size (e.g. for regular files))
+     * <10-byte file contents len>
+     * <file contents>
+     * ]
+     */
+    private function _cmdGetFiles($list)
+    {
+        $response = "";
+
+        $offset = 0;
+        while (true) {
+            if (($end_pos = mb_orig_strpos($list, "\n", $offset)) === false) break;
+            $file = mb_orig_substr($list, $offset, $end_pos - $offset);
+            $offset = $end_pos + 1;
+            $stat = $this->_stat($file);
+            $response .= sprintf("%10u", mb_orig_strlen($file));
+            $response .= $file;
+            $response .= sprintf("%10u", mb_orig_strlen($stat));
+            $response .= $stat;
+            if ($this->_getSizeFromStat($stat)) {
+                $contents = file_get_contents($file);
+                $response .= sprintf("%10u", mb_orig_strlen($contents));
+                $response .= $contents;
+            }
+
+        }
+
+        return $response;
     }
 
     private function _cmdDiff()
