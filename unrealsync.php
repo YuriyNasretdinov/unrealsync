@@ -13,6 +13,17 @@ if (!function_exists('mb_orig_strpos')) {
     }
 }
 
+function force_unrealsync_destruct()
+{
+    global $unrealsync;
+    if ($unrealsync) {
+        $unrealsync->finish();
+        $unrealsync = null;
+    }
+}
+
+register_shutdown_function('force_unrealsync_destruct');
+
 try {
     $unrealsync = new Unrealsync();
     $unrealsync->init($argv);
@@ -25,6 +36,7 @@ try {
 
 class UnrealsyncException extends Exception {}
 class UnrealsyncIOException extends UnrealsyncException {}
+class UnrealsyncFileException extends UnrealsyncException {}
 
 class Unrealsync
 {
@@ -45,6 +57,13 @@ class Unrealsync
     const CMD_DIFF = 'diff';
     const CMD_PING = 'ping';
     const CMD_GET_FILES = 'getfiles';
+    const CMD_COMMIT = "commit";
+    const CMD_APPLY_DIFF = "applydiff";
+
+    /* diff answers */
+    const EMPTY_LOCAL  = "local\n";
+    const EMPTY_REPO   = "repo\n";
+    const EMPTY_HEADER = "EMPTY:";
 
     const MAX_MEMORY = 16777216; // max 16 Mb per read
     const MAX_CONFLICTS = 20;
@@ -58,7 +77,6 @@ class Unrealsync
 
     /* options from config */
     var $servers = array();
-    var $excludes = array();
 
     var $watcher = array(
         'pp'   => null, // proc_open handle
@@ -69,14 +87,22 @@ class Unrealsync
         // srv => array(pp => ..., read_pipe => ..., write_pipe => ...)
     );
 
+    /* default ignores */
+    var $exclude = array(
+        '.' => true, '..' => true, '.unrealsync' => true
+    );
+
     private $lockfp = null;
     private $timers = array();
+
+    private $finished = false;
 
     function init($argv)
     {
         unset($argv[0]);
         foreach ($argv as $k => $v) {
             if ($v === '--server') $this->is_server = true;
+            else if ($v === '--debug') $this->is_debug = true;
             else                   continue;
             unset($argv[$k]);
         }
@@ -87,12 +113,20 @@ class Unrealsync
             exit(1);
         }
 
+        $this->_setupPHP();
         $this->_setupOS();
         $this->_setupSettings();
     }
 
     function __destruct()
     {
+        $this->finish();
+    }
+
+    function finish()
+    {
+        if ($this->finished) return;
+        $this->finished = true;
         if ($this->watcher['pp']) {
             proc_terminate($this->watcher['pp']);
             proc_close($this->watcher['pp']);
@@ -103,6 +137,15 @@ class Unrealsync
                 $this->_remoteExecute($srv, self::CMD_SHUTDOWN);
             }
         }
+    }
+
+    /* PHP must write all errors to STDERR as otherwise it will interfere with our communication protocol that uses STDOUT */
+    private function _setupPHP()
+    {
+        error_reporting(E_ALL | E_STRICT);
+        ini_set('display_errors', 0);
+        ini_set('log_errors', 1);
+        ini_set('error_log', null);
     }
 
     private function _setupOS()
@@ -127,18 +170,23 @@ class Unrealsync
     private function _setupUnrealsyncDir()
     {
         if ($this->is_server) chdir(dirname(__DIR__));
-        if (is_dir(self::REPO)) return true;
-        $old_cwd = getcwd();
-        while (realpath('..') != realpath(getcwd())) {
-            if (!chdir('..')) break;
-            if (is_dir(self::REPO)) break;
-        }
         if (!is_dir(self::REPO)) {
-            chdir($old_cwd);
-            return false;
+            $old_cwd = getcwd();
+            while (realpath('..') != realpath(getcwd())) {
+                if (!chdir('..')) break;
+                if (is_dir(self::REPO)) break;
+            }
+            if (!is_dir(self::REPO)) {
+                chdir($old_cwd);
+                return false;
+            }
         }
-
-        if (!file_exists(self::REPO_TMP)) mkdir(self::REPO_TMP);
+        if (!is_dir(self::REPO_TMP) && !mkdir(self::REPO_TMP)) {
+            throw new UnrealsyncException("Cannot create directory " . self::REPO_TMP);
+        }
+        if (!is_dir(self::REPO_FILES) && !mkdir(self::REPO_FILES)) {
+            throw new UnrealsyncException("Cannot create directory " . self::REPO_FILES);
+        }
         return true;
     }
 
@@ -182,7 +230,11 @@ class Unrealsync
         if (!isset($config['general_settings'])) throw new UnrealsyncException("Section [general_settings] not found in $file");
         $core_settings = $config['general_settings'];
         unset($config['general_settings']);
-        if (isset($core_settings['exclude'])) $this->excludes = $core_settings['exclude'];
+        if (isset($core_settings['exclude'])) {
+            foreach ($core_settings['exclude'] as $excl) {
+                $this->exclude[$excl] = true;
+            }
+        }
         if (!count($config)) throw new UnrealsyncException("No server sections in $file");
         $this->servers = $config;
     }
@@ -530,7 +582,9 @@ class Unrealsync
         $dir = rtrim($dir, '/');
         $repo_dir = $dir . '/' . self::REPO;
         $dir_esc = escapeshellarg($repo_dir);
+        echo "  Creating $repo_dir...";
         $result = $this->ssh($host, "if [ ! -d $dir_esc ]; then exec mkdir $dir_esc; fi; exit 0", $data);
+        echo "done\n";
         if ($result === false) throw new UnrealsyncException("Cannot create $dir for $srv");
         if (empty($data['os'])) {
             echo "Retrieving OS because it was not specified in config\n";
@@ -539,11 +593,13 @@ class Unrealsync
         }
         $data['os'] = ucfirst(strtolower($data['os']));
         if (!in_array($data['os'], array('Linux', 'Darwin'))) throw new UnrealsyncException("Unsupported remote os '$data[os]' for $srv");
+        echo "  Copying files...";
         $watcher_path = __DIR__ . '/bin/' . strtolower($data['os']) . '/notify';
         $result = $this->scp($host, array(__FILE__, $watcher_path), $repo_dir . '/');
+        echo "done\n";
         if ($result === false) throw new UnrealsyncException("Cannot scp unrealsync.php and watcher to $srv");
 
-        echo "  Starting unrealsync server on $srv\n";
+        echo "  Starting unrealsync server on $srv...";
 
         $result = $this->ssh(
             $host,
@@ -552,14 +608,22 @@ class Unrealsync
         );
         if ($result === false) throw new UnrealsyncException("Cannot start unrealsync daemon on $srv");
 
+        echo "done\n";
+
         $this->remotes[$srv] = $result;
         if ($this->_remoteExecute($srv, self::CMD_PING) != "pong") {
             throw new UnrealsyncException("Ping failed. Something went wrong.");
         }
 
-        echo "  Getting remote diff from $srv\n";
+        echo "  Getting remote diff from $srv...";
         $remote_diff = $this->_remoteExecute($srv, self::CMD_DIFF);
-        $this->_applyRemoteDiff($srv, $remote_diff);
+        echo "done\n";
+        if (substr($remote_diff, 0, mb_orig_strlen(self::EMPTY_HEADER)) === self::EMPTY_HEADER) {
+            $this->_handleEmpty($srv, $remote_diff);
+        } else {
+//            $this->_applyRemoteDiff($srv, $remote_diff);
+            echo "Diff from $srv was not applied (not implemented yet)\n";
+        }
     }
 
 
@@ -582,11 +646,97 @@ class Unrealsync
         return proc_close($proc);
     }
 
-    /* go through remote diff, apply diff and report about conflicts */
+    const SYNC_FROM_LOCAL = "local";
+    const SYNC_FROM_REMOTE = "remote";
+
+    /* handle situation when remote repository or remote work copy is empty */
+    private function _handleEmpty($srv, $response)
+    {
+        $empty_repo = (strpos($response, self::EMPTY_REPO) !== false);
+        $empty_local = (strpos($response, self::EMPTY_LOCAL) !== false);
+
+        if ($empty_local && $empty_repo) {
+            echo "  Remote $srv is completely empty. Transferring changes from local machine\n";
+        } else if ($empty_local) {
+            if (!$this->askYN("  Remote $srv has .unrealsync repository, but no files are present. Ignore remote repository?")) {
+                throw new UnrealsyncException("No automatic action can be performed. Please fix this issue manually");
+            }
+        } else if ($empty_repo) {
+            echo "  Remote $srv has some files while .unrealsync repository is empty.\n\n";
+            return $this->_sync($srv);
+        } else {
+            throw new UnrealsyncException("Internal error: unreachable code");
+        }
+
+        return $this->_sync($srv, self::SYNC_FROM_LOCAL);
+    }
+
+    private function _askSyncDirection($srv)
+    {
+        $sync_direction = false;
+
+        echo "  Only one-way offline synchronization is supported\n";
+        echo "  You can choose either local or remote copies to be propagated.\n";
+        echo "  If you choose '" . self::SYNC_FROM_LOCAL . "', all changes on $srv will be LOST and vice versa\n\n";
+        $is_ok = false;
+        while (!$is_ok) {
+            $sync_direction = $this->ask(
+                "  Please choose primary repository (" . self::SYNC_FROM_LOCAL . " or " . self::SYNC_FROM_REMOTE . "):",
+                self::SYNC_FROM_LOCAL,
+                array(self::SYNC_FROM_LOCAL, self::SYNC_FROM_REMOTE)
+            );
+
+            if ($sync_direction === self::SYNC_FROM_LOCAL) $q = "  All changes (if any) at $srv will be lost. Continue? ";
+            else $q = "  All local changes will be lost. Continue? ";
+
+            if ($this->askYN($q)) $is_ok = true;
+        }
+
+        return $sync_direction;
+    }
+
+    private function _sync($srv, $sync_direction = null)
+    {
+        if (!$sync_direction) $sync_direction = $this->_askSyncDirection($srv);
+
+        $rsync_cmd = "rsync -a --delete --exclude=" . self::REPO . " ";
+        $remote_arg = escapeshellarg($this->servers[$srv]['host'] . ":" . rtrim($this->servers[$srv]['dir'], "/") . "/");
+        switch ($sync_direction) {
+            case self::SYNC_FROM_LOCAL:
+                echo "  Rsync to $srv...";
+                $cmd = "$rsync_cmd ./ $remote_arg";
+                $this->_exec($cmd, $out, $retval);
+                if ($retval) throw new UnrealsyncException("Cannot do '$cmd'");
+                echo "done\n";
+                break;
+            case self::SYNC_FROM_REMOTE:
+                echo "  Rsync from $srv...";
+                $cmd = "$rsync_cmd $remote_arg ./";
+                $this->_exec($cmd, $out, $retval);
+                if ($retval) throw new UnrealsyncException("Cannot do '$cmd'");
+                echo "done\n";
+                break;
+            default:
+                throw new UnrealsyncException("Unknown sync direction: $sync_direction");
+        }
+
+        return true;
+    }
+
+    private function _exec($cmd, &$out, &$retval)
+    {
+        $this->debug($cmd);
+        return exec($cmd, $out, $retval);
+    }
+
+    /* go through remote diff, apply diff and report about conflicts
+       if $with_contents = true, then diff with contents is expected and any conflicts are ignored
+     */
     private function _applyRemoteDiff($srv, $diff)
     {
-        echo "  Applying remote diff: ";
+        fwrite(STDERR, "$this->hostname\$  Applying remote diff: ");
         $this->_timerStart();
+        $ignore_conflicts = true;
         $offset = 0;
         $stats = array('A' => 0, 'D' => 0, 'M' => 0);
         // We do not use explode() in order to save memory, because we need about 3 times more memory for our case
@@ -603,34 +753,61 @@ class Unrealsync
             $first_line_pos = mb_orig_strpos($chunk, "\n");
             if ($first_line_pos === false) throw new UnrealsyncException("No new line in diff chunk: $chunk");
             $first_line = mb_orig_substr($chunk, 0, $first_line_pos);
-            $filename = mb_orig_substr($first_line, 2);
-            if (!$filename) throw new UnrealsyncException("No filename in diff chunk: $chunk");
+            $file = mb_orig_substr($first_line, 2);
+            if (!$file) throw new UnrealsyncException("No filename in diff chunk: $chunk");
+            $rfile = self::REPO_FILES . "/$file";
             $chunk = mb_orig_substr($chunk, $first_line_pos + 1);
-            $stat = $this->_stat($filename);
-            $rstat = $this->_rstat($filename);
+            $stat = $this->_stat($file);
+            $rstat = $this->_rstat($file);
+            $contents = false;
+            if ($op === 'A' || $op === 'M') {
+                if ($op === 'A') $diffstat = $chunk;
+                else list ($oldstat, $diffstat) = explode("\n\n", $chunk);
 
+                if ($diffstat !== "dir" && strpos($diffstat, "symlink=") === false) {
+                    $length = intval(mb_orig_substr($diff, $offset, 10));
+                    if ($length > self::MAX_MEMORY) throw new UnrealsyncException("Too big file, probably commucation error");
+                    $offset += 10;
+                    $contents = mb_orig_substr($diff, $offset, $length);
+                    $offset += $length;
+                }
+            }
+
+            /* TODO: write all possible cases, not just simple ones */
             if ($op === 'A') {
                 $diffstat = $chunk;
                 if ($stat === $diffstat) continue; // the same file was added
-                if (!$stat) { // we did not have file, we need to retrieve its contents
-                    $recv_list .= $this->_getSizeFromStat($diffstat) . " $filename\n";
+                if (!$stat || $ignore_conflicts) { // we did not have file, we need to retrieve its contents
+                    $this->_writeFile($file, $diffstat, $contents);
                     continue;
                 }
-                $conflicts .= "Add/add conflict: $filename\n";
-                $conf_list .= $this->_getSizeFromStat($diffstat) . " $filename\n";
+                $conflicts .= "Add/add conflict: $file\n";
+                $conf_list .= $this->_getSizeFromStat($diffstat) . " $file\n";
+                if ($this->is_debug) {
+                    $conflicts .= "local stat: $stat\n\n";
+                    $conflicts .= "remote stat: $diffstat\n\n";
+                }
             } else if ($op === 'D') {
-
+                if ($stat) $this->_removeRecursive($file);
+                if ($rstat) $this->_removeRecursive($rfile);
             } else if ($op === 'M') {
-
+                list ($oldstat, $diffstat) = explode("\n\n", $chunk);
+                if ($stat === $diffstat) continue; // identical changes
+                if (!$ignore_conflicts && $oldstat !== $stat) {
+                    $conflicts .= "Modify/modify conflict: $file\n";
+                    $conf_list .= $this->_getSizeFromStat($diffstat) . " $file\n";
+                    continue;
+                }
+                $this->_writeFile($file, $diffstat, $contents);
             } else {
                 throw new UnrealsyncException("Unexpected diff chunk: $chunk");
             }
         }
 
-        if ($stats['A']) echo "$stats[A] files added ";
-        if ($stats['D']) echo "$stats[D] files deleted ";
-        if ($stats['M']) echo "$stats[M] files changed ";
-        echo "\n";
+        if ($stats['A']) fwrite(STDERR, "$stats[A] files added ");
+        if ($stats['D']) fwrite(STDERR, "$stats[D] files deleted ");
+        if ($stats['M']) fwrite(STDERR, "$stats[M] files changed ");
+        fwrite(STDERR, "\n");
 
         $this->_timerStop("Apply remote diff done");
 
@@ -650,88 +827,14 @@ class Unrealsync
                 echo $conflicts . "\n";
             }
 
-            $q = "What do we do? Options: 'a' (Abort), 't' (use Their copy) or 'o' (use Our copy)";
-            $answer = $this->ask($q, 'a', array('a', 't', 'o'));
+            $q = "Which version should be used ('local' or 'remote')?";
+            $answer = $this->ask($q, 'local', array('local', 'remote'));
             if ($tmpfile) unlink($tmpfile);
-            if ($answer === 'a') die("Exiting");
             if ($answer === 't') $recv_list .= $conf_list;
         }
 
-        if ($recv_list) {
-            $num = substr_count($recv_list, "\n");
-            echo "  Receiving $num file" . ($num > 1 ? "s" : "") . "\n";
-            $this->_receiveFiles($srv, $recv_list);
-        } else {
-            echo "  No changes detected\n";
-        }
-
+        $this->_commitDiff($diff, true);
         $this->debug("Peak memory: " . memory_get_peak_usage(true));
-    }
-
-    private function _receiveFiles($srv, $recv_list)
-    {
-        $max_requested_size = self::MAX_MEMORY / 2;
-        $queue = "";
-        $offset = 0;
-        $total_size = 0;
-        $big_files = array();
-
-        while (true) {
-            if (($end_pos = mb_orig_strpos($recv_list, "\n", $offset)) === false) break;
-            list($size, $file) = explode(" ", mb_orig_substr($recv_list, $offset, $end_pos - $offset), 2);
-            $offset = $end_pos + 1;
-            if ($size > $max_requested_size) {
-                $big_files[] = $file;
-                continue;
-            }
-
-            if ($total_size + $size > $max_requested_size) {
-                $this->_receiveFilesQueue($srv, $queue);
-                $queue = "";
-            }
-
-            $queue .= "$file\n";
-        }
-
-        if (mb_orig_strlen($queue)) $this->_receiveFilesQueue($srv, $queue);
-        if ($big_files) $this->_receiveBigFiles($srv, $big_files);
-    }
-
-    private function _receiveBigFiles($srv, array $big_files)
-    {
-        foreach ($big_files as $file) {
-            echo "Receiving big file: $file\n";
-            // TODO: do actual receive :))
-        }
-    }
-
-    private function _receiveFilesQueue($srv, $queue)
-    {
-        $response = $this->_remoteExecute($srv, self::CMD_GET_FILES, $queue);
-        $offset = 0;
-        $response_len = mb_orig_strlen($response);
-
-        while ($offset < $response_len) {
-            $filename_len = intval(mb_orig_substr($response, $offset, 10));
-            $offset += 10;
-            $filename = mb_orig_substr($response, $offset, $filename_len);
-            $offset += $filename_len;
-
-            $stat_len = intval(mb_orig_substr($response, $offset, 10));
-            $offset += 10;
-            $stat = mb_orig_substr($response, $offset, $stat_len);
-            $offset += $stat_len;
-
-            $contents = "";
-            if ($this->_getSizeFromStat($stat)) {
-                $contents_len = intval(mb_orig_substr($response, $offset, 10));
-                $offset += 10;
-                $contents = mb_orig_substr($response, $contents_len, 10);
-                $offset += $contents_len;
-            }
-
-            $this->_writeFile($filename, $stat, $contents);
-        }
     }
 
     /*
@@ -744,16 +847,33 @@ class Unrealsync
         if ($stat === "dir") {
             if ($old_stat === "dir") return true;
             $this->_removeRecursive($filename);
-            if (!mkdir($filename)) return false;
+            if (!mkdir($filename, 0777, true)) throw new UnrealsyncException("Cannot create dir $filename");
         } else if (strpos($stat, "symlink=") === 0) {
             if (strpos($old_stat, "symlink=") !== 0) $this->_removeRecursive($filename);
             list(, $lnk) = explode("=", $stat, 2);
-            if (!symlink($lnk, $filename)) return false;
+            if (!symlink($lnk, $filename)) {
+                throw new UnrealsyncException("Cannot create symlink $filename");
+            }
         } else {
             if ($this->is_unix) {
+                if (!is_dir(dirname($filename))) mkdir(dirname($filename), 0777, true);
                 $tmp = self::REPO_TMP . "/" . basename($filename);
-                if (!file_put_contents($tmp, $contents)) return false;
-                if (!rename($tmp, $filename)) return false;
+                $bytes_written = file_put_contents($tmp, $contents);
+                if ($bytes_written === false || $bytes_written != mb_orig_strlen($contents)) {
+                    throw new UnrealsyncException("Cannot write contents to $tmp");
+                }
+                foreach (explode("\n", $stat) as $ln) {
+                    list($field, $value) = explode("=", $ln);
+                    if ($field === "mode" && !chmod($tmp, $value)) {
+                        throw new UnrealsyncException("Cannot chmod $filename");
+                    } else if ($field === "mtime" && !touch($tmp, $value)) {
+                        throw new UnrealsyncException("Cannot set mtime for $filename");
+                    }
+                }
+                if (!rename($tmp, $filename)) {
+                    fwrite(STDERR, "Cannot rename $tmp to $filename");
+                    return false;
+                }
             }
         }
 
@@ -765,18 +885,30 @@ class Unrealsync
      */
     private function _commit($filename, $stat = null)
     {
+        if ($filename === "." || !$filename) return true;
+
         if (!$stat) $stat = $this->_stat($filename);
         $repof = self::REPO_FILES . "/$filename";
+        $rstat = $this->_rstat($filename);
 
         if ($stat === "dir") {
-            if (!is_dir($repof)) unlink($repof);
-            if (!mkdir($repof)) return false;
+            if ($rstat && $rstat !== "dir" && !unlink($repof)) throw new UnrealsyncException("Cannot remove $repof");
+            if ($rstat !== "dir" && !mkdir($repof, 0777, true)) throw new UnrealsyncException("Cannot create dir $repof");
             return true;
         }
 
+        if ($rstat === "dir") $this->_removeRecursive($repof);
+        if (!is_dir(dirname($repof))) mkdir(dirname($repof), 0777, true);
+
         $tmp = self::REPO_TMP . "/" . basename($filename);
-        if (!file_put_contents($tmp, $stat)) return false;
-        if (!rename($tmp, $repof)) return false;
+        $bytes_written = file_put_contents($tmp, $stat);
+        if ($bytes_written === false || $bytes_written != mb_orig_strlen($stat)) {
+            throw new UnrealsyncException("Cannot write contents to $tmp");
+        }
+        if (!rename($tmp, $repof)) {
+            fwrite(STDERR, "$this->hostname\$ Cannot rename $tmp to $repof\n");
+            return false;
+        }
         return true;
     }
 
@@ -818,67 +950,121 @@ class Unrealsync
         return $response;
     }
 
+    private function _dirIsEmpty($dir)
+    {
+        $dh = opendir($dir);
+        if (!$dh) throw new UnrealsyncException("Cannot open directory $dir");
+        $is_empty = true;
+        while (false !== ($file = readdir($dh))) {
+            if (isset($this->exclude[$file])) continue;
+            $is_empty = false;
+            break;
+        }
+        closedir($dh);
+        return $is_empty;
+    }
+
     private function _cmdDiff()
     {
-        if (!is_dir(self::REPO_FILES) && !mkdir(self::REPO_FILES)) {
-            throw new UnrealsyncException("Cannot create directory " . self::REPO_FILES);
-        }
+        $empty = "";
+        if ($this->_dirIsEmpty(".")) $empty .= self::EMPTY_LOCAL;
+        if ($this->_dirIsEmpty(self::REPO_FILES)) $empty .= self::EMPTY_REPO;
+        if ($empty) return self::EMPTY_HEADER . $empty;
 
         $diff = "";
         $this->_appendDiff(".", $diff);
         return $diff;
     }
 
-    private function _appendDiff($dir, &$diff)
+    private function _appendContents($file, $stat, &$diff)
     {
-        $dh = opendir($dir);
-        $files = array();
-        while (false !== ($rel_path = readdir($dh))) {
-            if ($rel_path === "." || $rel_path === ".." || $dir === "." && $rel_path === self::REPO) continue;
-            $file = "$dir/$rel_path";
-            $stat = $this->_stat($file);
-            if (!$stat) {
-                $this->debug("Cannot compute lstat for $file");
-                continue;
+        if (strpos($stat, "symlink=") !== false) return;
+        $contents = file_get_contents($file);
+        if ($contents === false) throw new UnrealsyncFileException("Cannot read $file");
+        $size = $this->_getSizeFromStat($stat);
+        if (mb_orig_strlen($contents) != $size) throw new UnrealsyncFileException("Actual file size does not match stat");
+        $diff .= sprintf("%10u", $size);
+        $diff .= $contents;
+    }
+
+    private function _appendDiff($dir, &$diff, $include_contents = false, $recursive = true)
+    {
+        // if we cannot open directory, it means that it vanished during diff computation. It is actually acceptable
+        @$dh = opendir($dir);
+        if (!$dh) throw new UnrealsyncFileException("Cannot opendir($dir)");
+        try {
+            $files = array();
+            while (false !== ($rel_path = readdir($dh))) {
+                if (isset($this->exclude[$rel_path])) continue;
+                $file = "$dir/$rel_path";
+                $stat = $this->_stat($file);
+                if (!$stat) throw new UnrealsyncFileException("File vanished: $file");
+
+                $files[$file] = true;
+                $rstat = $this->_rstat($file);
+
+                if (!$rstat) {
+                    if ($stat === "dir") {
+                        $this->_appendAddedFiles($file, $diff, $include_contents);
+                    } else {
+//                        fwrite(STDERR, "File added: $file\n");
+                        $str = "A $file\n$stat" . self::SEPARATOR;
+                        $this->debug($str);
+                        $diff .= $str;
+                        if ($include_contents) $this->_appendContents($file, $stat, $diff);
+                    }
+                    continue;
+                }
+
+                if ($stat === $rstat) {
+                    if ($stat === "dir" && $recursive) $this->_appendDiff($file, $diff);
+                    continue;
+                }
+
+//                fwrite(STDERR, "File changed: $file\n");
+                $str = "M $file\n$rstat\n\n$stat" . self::SEPARATOR;
+                $this->debug($str);
+                $diff .= $str;
+                if ($include_contents) $this->_appendContents($file, $stat, $diff);
             }
-
-            $files[$file] = true;
-            $rstat = $this->_rstat($file);
-
-            if (!$rstat) {
-                if ($stat === "dir") $this->_appendAddedFiles($file, $diff);
-                else                 $diff .= "A $file\n$stat" . self::SEPARATOR;
-                continue;
-            }
-
-            if ($stat === $rstat) {
-                if ($stat === "dir") $this->_appendDiff($file, $diff);
-                continue;
-            }
-
-            $diff .= "M $file\n$stat\n\n$rstat" . self::SEPARATOR;
+        } catch (Exception $e) {
+            closedir($dh);
+            throw $e;
         }
+
         closedir($dh);
 
         // determine deletions by looking up files that are present in repository but not on disk
-        $dh = opendir(self::REPO_FILES . "/$dir");
-        while (false !== ($rel_path = readdir($dh))) {
-            if ($rel_path === "." || $rel_path === "..") continue;
-            $file = "$dir/$rel_path";
-            if (isset($files[$file])) continue;
+        // It is ok if we do not yet have any repository entry for directory because it needs to be commited first
+        @$dh = opendir(self::REPO_FILES . "/$dir");
+        if ($dh) {
+            while (false !== ($rel_path = readdir($dh))) {
+                if ($rel_path === "." || $rel_path === "..") continue;
+                $file = "$dir/$rel_path";
+                if (isset($files[$file])) continue;
 
-            $rstat = $this->_rstat($file);
-            $diff .= "D $file\n$rstat" . self::SEPARATOR;
+                $rstat = $this->_rstat($file);
+//                fwrite(STDERR, "File deleted: $file\n");
+                $str = "D $file\n$rstat" . self::SEPARATOR;
+                $this->debug($str);
+                $diff .= $str;
+            }
+            closedir($dh);
         }
-        closedir($dh);
     }
 
-    private function _appendAddedFiles($dir, &$diff)
+    private function _appendAddedFiles($dir, &$diff, $include_contents = false)
     {
+        @$dh = opendir($dir);
+        if (!$dh) {
+            $this->debug("_appendAddedFiles: cannot opendir($dir)");
+            return;
+        }
+//        fwrite(STDERR, "Dir added: $dir\n");
         $diff .= "A $dir\ndir" . self::SEPARATOR;
-        $dh = opendir($dir);
+
         while (false !== ($rel_path = readdir($dh))) {
-            if ($rel_path === "." || $rel_path === "..") continue;
+            if (isset($this->exclude[$rel_path])) continue;
             $file = "$dir/$rel_path";
             $stat = $this->_stat($file);
             if (!$stat) {
@@ -886,8 +1072,13 @@ class Unrealsync
                 continue;
             }
 
-            if ($stat === "dir") $this->_appendAddedFiles($file, $diff);
-            else                 $diff .= "A $file\n$stat" . self::SEPARATOR;
+            if ($stat === "dir") {
+                $this->_appendAddedFiles($file, $diff, $include_contents);
+            } else {
+//                fwrite(STDERR, "File added: $file\n");
+                $diff .= "A $file\n$stat" . self::SEPARATOR;
+                if ($include_contents) $this->_appendContents($file, $stat, $diff);
+            }
         }
         closedir($dh);
     }
@@ -906,6 +1097,7 @@ class Unrealsync
     /* get file stat that we have in repository (if any) */
     private function _rstat($short_filename)
     {
+        clearstatcache();
         $filename = self::REPO_FILES . "/$short_filename";
         if (!file_exists($filename)) return "";
         if (is_dir($filename)) return "dir";
@@ -915,6 +1107,7 @@ class Unrealsync
     /* get file stat, that is used to compare local and remote files */
     private function _stat($filename)
     {
+        clearstatcache();
         $result = @lstat($filename);
         if ($result === false) return '';
         switch ($result['mode'] & 0170000) {
@@ -924,12 +1117,175 @@ class Unrealsync
                 return "symlink=" . readlink($filename);
             case 0100000: // regular file
                 $mode = $result['mode'] & 0777;
-                // we only support 777 and 666 (with default umask it is 755 and 644 accordingly) for windows compatibility
-                if ($mode & 0700 == 0700) $mode = 0777;
-                else $mode = 0666;
+                if (!$this->is_unix) {
+                    // we only support 777 and 666 (with default umask it is 755 and 644 accordingly) on windows
+                    if ($mode & 0700 == 0700) $mode = 0777;
+                    else $mode = 0666;
+                }
                 return sprintf("mode=%d\nsize=%d\nmtime=%d", $mode, $result['size'], $result['mtime']);
         }
         return '';
+    }
+
+    /*
+     * Commit whole directory, recursively by default
+     */
+    private function _commitDir($dir = ".", $recursive = true)
+    {
+        $dh = opendir($dir);
+        if (!$dh) {
+            fwrite(STDERR, "Cannot open $dir for commiting changes\n");
+            return false;
+        }
+
+        while (false !== ($rel_path = readdir($dh))) {
+            if (isset($this->exclude[$rel_path])) continue;
+            $file = "$dir/$rel_path";
+            $rfile = self::REPO_FILES . "/$file";
+
+            $stat = $this->_stat($file);
+            $rstat = $this->_rstat($file);
+            if ($stat === $rstat) {
+                if ($stat === "dir" && $recursive) $this->_commitDir($file);
+                continue;
+            }
+
+            if ($rstat && $stat === "dir") $this->_removeRecursive($rfile);
+            $this->_commit($file, $stat);
+            if ($stat === "dir") $this->_commitDir($file);
+        }
+
+        closedir($dh);
+
+        /* looking for deleted entities */
+        $dh = opendir($repo_dir = self::REPO_FILES . "/$dir");
+        if (!$dh) {
+            fwrite(STDERR, "Cannot open $repo_dir for commiting changes\n");
+            return false;
+        }
+
+        while (false !== ($rel_path = readdir($dh))) {
+            if (isset($this->exclude[$rel_path])) continue;
+            $file = "$dir/$rel_path";
+            $rfile = self::REPO_FILES . "/$file";
+
+            $stat = $this->_stat($file);
+            $rstat = $this->_rstat($file);
+
+            if ($rstat && !$stat) $this->_removeRecursive($rfile);
+        }
+        closedir($dh);
+
+        return true;
+    }
+
+    /* Commit changes that were sent in $diff */
+    private function _commitDiff($diff, $with_contents = false)
+    {
+        $offset = 0;
+
+//        fwrite(STDERR, "$this->hostname\$ committing diff\n");
+
+        while (true) {
+            if (($end_pos = mb_orig_strpos($diff, self::SEPARATOR, $offset)) === false) break;
+            $chunk = mb_orig_substr($diff, $offset, $end_pos - $offset);
+            $offset = $end_pos + mb_orig_strlen(self::SEPARATOR);
+            $op = $chunk[0];
+            $first_line_pos = mb_orig_strpos($chunk, "\n");
+            if ($first_line_pos === false) throw new UnrealsyncException("No new line in diff chunk: $chunk");
+            $first_line = mb_orig_substr($chunk, 0, $first_line_pos);
+            $file = mb_orig_substr($first_line, 2);
+            if (!$file) throw new UnrealsyncException("No filename in diff chunk: $chunk");
+            $rfile = self::REPO_FILES . "/$file";
+            $chunk = mb_orig_substr($chunk, $first_line_pos + 1);
+
+            if ($op === 'A' || $op === 'M') {
+                if ($op === 'A') $diffstat = $chunk;
+                else list ($oldstat, $diffstat) = explode("\n\n", $chunk);
+
+                if ($with_contents) {
+                    if ($diffstat !== "dir" && strpos($diffstat, "symlink=") === false) {
+                        $length = intval(mb_orig_substr($diff, $offset, 10));
+                        $offset += 10 + $length;
+                    }
+                }
+
+//                fwrite(STDERR, "$this->hostname\$ $op $file\n");
+                $this->_commit($file, $diffstat);
+            } else if ($op === 'D') {
+//                fwrite(STDERR, "$this->hostname\$ Delete $rfile\n");
+                $this->_removeRecursive($rfile);
+            }
+        }
+    }
+
+    private function _cmdCommit()
+    {
+        return $this->_commitDir();
+    }
+
+    private function _removeRecursive($path)
+    {
+        $stat = $this->_stat($path);
+        if (!$stat) return true;
+        if ($stat != "dir") return unlink($path);
+
+        $dh = opendir($path);
+        if (!$dh) return false;
+
+        while (false !== ($rel_path = readdir($dh))) {
+            if ($rel_path === "." || $rel_path === "..") continue;
+            $this->_removeRecursive("$path/$rel_path");
+        }
+
+        closedir($dh);
+
+        return rmdir($path);
+    }
+
+    private function _getDirsDiff($dirs)
+    {
+        $diff = "";
+        foreach ($dirs as $dir) $this->_appendDiff($dir, $diff, true, false);
+        if ($this->is_debug) file_put_contents("/tmp/unrealsync", $diff, FILE_APPEND);
+        return $diff;
+    }
+
+    private function _cmdApplyDiff($diff)
+    {
+        $this->_applyRemoteDiff($this->hostname, $diff, true);
+    }
+
+    /*
+     * Filter dirs using exclude and transform absolute paths to relative
+     */
+    private function _getFilteredDirs($dirs)
+    {
+        $curdir = getcwd();
+
+        foreach ($dirs as $idx => $dir) {
+            if ($dir === $curdir) $dir = ".";
+            if (mb_orig_strpos($dir, "$curdir/") === 0) $dir = mb_orig_substr($dir, mb_orig_strlen($curdir) + 1);
+
+            $parts = explode("/", $dir);
+            foreach ($parts as $p) {
+                if ($p === ".") continue;
+                if (isset($this->exclude[$p])) {
+                    unset($dirs[$idx]);
+                    continue(2);
+                }
+            }
+
+            /* check if dir is still present, because event could be delivered when dir does not exist anymore */
+            $stat = $this->_stat($dir);
+            if ($stat !== 'dir') {
+                unset($dirs[$idx]);
+                continue;
+            }
+            $dirs[$idx] = $dir;
+        }
+
+        return $dirs;
     }
 
     function runServer()
@@ -956,10 +1312,66 @@ class Unrealsync
     {
         if ($this->is_server) return $this->runServer();
 
-        $this->_startLocalWatcher();
         foreach ($this->servers as $srv => $srv_data) {
             echo "Doing initial synchronization for $srv\n";
             $this->_bootstrap($srv);
         }
+
+        foreach ($this->servers as $srv => $srv_data) {
+            echo "Propagating merged changes to $srv\n";
+            $this->_sync($srv, self::SYNC_FROM_LOCAL);
+            if (!$this->_remoteExecute($srv, self::CMD_COMMIT)) {
+                throw new UnrealsyncException("Cannot commit changes at $srv");
+            }
+        }
+
+        echo "Commiting local changes...";
+        if (!$this->_commitDir()) throw new UnrealsyncException("Cannot commit changes locally");
+        echo "done\n";
+
+        echo "Starting local watcher...";
+        $this->_startLocalWatcher();
+        echo "done\n";
+        $dir_hashes = array();
+
+        while (false !== ($ln = fgets($this->watcher['pipe']))) {
+//            echo "Read $ln";
+            $ln = rtrim($ln);
+            if ($ln === "-") {
+                $diff = '';
+                while (true) {
+                    $have_errors = false;
+                    $dirs = $this->_getFilteredDirs(array_keys($dir_hashes));
+                    if (!$dirs) break;
+                    try {
+                        echo "\nChanged dirs: " . implode(" ", $dirs) . "\n";
+                        $diff = $this->_getDirsDiff($dirs);
+                        $len = mb_orig_strlen($diff);
+                        echo "diff size " . ($len > 1024 ? round($len / 1024) . " KiB" : $len . " bytes") . "\n";
+                    } catch (UnrealsyncFileException $e) {
+                        $have_errors = true;
+                        echo "Got an error during diff computation: " . $e->__toString() . "\n";
+                    }
+
+                    if (!$have_errors) break;
+
+                    echo "Got errors during diff computation. Waiting 1s to try again\n";
+                    sleep(1);
+                }
+
+                if (mb_orig_strlen($diff) > 0) {
+                    foreach ($this->servers as $srv => $_) $this->_remoteExecute($srv, self::CMD_APPLY_DIFF, $diff);
+                    $this->_commitDiff($diff, true);
+                }
+                $dir_hashes = array();
+                continue;
+            }
+            /* turn changes in separate files into changes in directories for Mac OS X watcher compatibility */
+            list(, $file) = explode(" ", $ln, 2);
+            if (is_link($file) || !is_dir($file)) $file = dirname($file);
+            $dir_hashes[rtrim($file, "/")] = true;
+        }
+
+        return true;
     }
 }
