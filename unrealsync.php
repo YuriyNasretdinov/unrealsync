@@ -179,15 +179,8 @@ class Unrealsync
         }
 
         if (!is_dir(self::REPO)) {
-            $old_cwd = getcwd();
-            while (realpath('..') != realpath(getcwd())) {
-                if (!chdir('..')) break;
-                if (is_dir(self::REPO)) break;
-            }
-            if (!is_dir(self::REPO)) {
-                chdir($old_cwd);
-                return false;
-            }
+            chdir($old_cwd);
+            return false;
         }
         if (!is_dir(self::REPO_TMP) && !mkdir(self::REPO_TMP)) {
             throw new UnrealsyncException("Cannot create directory " . self::REPO_TMP);
