@@ -96,6 +96,7 @@ class Unrealsync
     private $timers = array();
 
     private $finished = false;
+    private $tmp;
 
     function init($argv)
     {
@@ -169,7 +170,14 @@ class Unrealsync
 
     private function _setupUnrealsyncDir()
     {
-        if ($this->is_server) chdir(dirname(__DIR__));
+        if ($this->is_server) chdir(dirname(__FILE__));
+        if (is_dir(self::REPO)) return true;
+        $old_cwd = getcwd();
+        while (realpath('..') != realpath(getcwd())) {
+            if (!chdir('..')) break;
+            if (is_dir(self::REPO)) break;
+        }
+
         if (!is_dir(self::REPO)) {
             $old_cwd = getcwd();
             while (realpath('..') != realpath(getcwd())) {
@@ -192,7 +200,8 @@ class Unrealsync
 
     private function _lock()
     {
-        if (!$this->lockfp = fopen(self::REPO_LOCK, 'a')) throw new UnrealsyncException("Cannot open " . self::REPO_LOCK);
+        $this->lockfp = fopen(self::REPO_LOCK, 'a');
+        if (!$this->lockfp) throw new UnrealsyncException("Cannot open " . self::REPO_LOCK);
         if (defined('LOCK_NB')) {
             if (!flock($this->lockfp, LOCK_EX | LOCK_NB, $wouldblock)) {
                 if ($wouldblock) {
@@ -278,26 +287,24 @@ class Unrealsync
         }
     }
 
+    private function _checkYN($answer)
+    {
+        if (in_array(strtolower($answer), array('yes', 'no', 'y', 'n'))) return true;
+        fwrite(STDERR, "Please write either yes or no\n");
+        return false;
+    }
+
     function askYN($q, $default = 'yes')
     {
-        $answer = $this->ask(
-            $q,
-            $default,
-            function ($answer) {
-                if (in_array(strtolower($answer), array('yes', 'no', 'y', 'n'))) return true;
-                fwrite(STDERR, "Please write either yes or no\n");
-                return false;
-            }
-        );
-
+        $answer = $this->ask($q, $default, array($this, '_checkYN'));
         return in_array(strtolower($answer), array('yes', 'y'));
     }
 
     private function _getSshOptions($options)
     {
         $cmd = " -C -o BatchMode=yes ";
-        if (!empty($options['username'])) $cmd .= " -l " . escapeshellarg($options['username']);
-        if (!empty($options['port']))     $cmd .= " -p " . intval($options['port']);
+        if (!empty($options['username'])) $cmd .= " -o User=" . escapeshellarg($options['username']);
+        if (!empty($options['port']))     $cmd .= " -o Port=" . intval($options['port']);
         return $cmd;
     }
 
@@ -369,104 +376,108 @@ class Unrealsync
         if (!$this->askYN("Going to begin sync now. Continue?")) exit(0);
     }
 
+    private function _verifyRemoteDir($dir)
+    {
+        echo "\rChecking...\r";
+        $dir = escapeshellarg($dir);
+        $cmd = "if [ -d $dir ]; then echo Exists; else exit 1; fi; if [ -w $dir ]; then echo Writable; fi";
+        $result = $this->ssh($this->tmp['host'], $cmd, $this->tmp['ssh_options']);
+        if (strpos($result, "Exists") === false) {
+            fwrite(STDERR, "\nRemote path $dir is not a directory\n");
+            return false;
+        }
+        if (strpos($result, "Writable") === false) {
+            fwrite(STDERR, "\nRemote directory $dir exists but it is not writable for you\n");
+            return false;
+        }
+        echo "Remote directory is OK          \n";
+        return true;
+    }
+
     private function _configWizardRemoteDir($ssh_options)
     {
-        $self = $this;
+        $this->tmp['ssh_options'] = $ssh_options;
         return $this->ask(
             "Remote directory to be synced",
             getcwd(),
-            function ($dir) use ($ssh_options, $self)
-            {
-                echo "\rChecking...\r";
-                $dir = escapeshellarg($dir);
-                $cmd = "if [ -d $dir ]; then echo Exists; else exit 1; fi; if [ -w $dir ]; then echo Writable; fi";
-                $result = $self->ssh($ssh_options['host'], $cmd, $ssh_options);
-                if (strpos($result, "Exists") === false) {
-                    fwrite(STDERR, "\nRemote path $dir is not a directory\n");
-                    return false;
-                }
-                if (strpos($result, "Writable") === false) {
-                    fwrite(STDERR, "\nRemote directory $dir exists but it is not writable for you\n");
-                    return false;
-                }
-                echo "Remote directory is OK          \n";
-                return true;
-            }
+            array($this, '_verifyRemoteDir')
         );
+    }
+
+    private function _configWizardAskRemoteAddress($str)
+    {
+        $os = $php_location = $username = $host = $port = '';
+        $this->tmp = array(
+            'os' => &$os, 'php_location' => &$php_location, 'username' => &$username, 'host' => &$host, 'port' => &$port
+        );
+
+        if (strpos($str, ":") !== false) {
+            list($str, $port) = explode(":", $str, 2);
+            if (!ctype_digit($port)) {
+                fwrite(STDERR, "Port must be numeric\n");
+                return false;
+            }
+        }
+
+        if (strpos($str, "@") !== false) {
+            list($username, $host) = explode("@", $str, 2);
+        } else {
+            $host = $str;
+        }
+
+        $this->tmp['ssh_options'] = $ssh_options = array('username' => $username, 'port' => $port);
+
+        echo "\rChecking connection...\r";
+        $result = $this->ssh($host, 'echo uname=`uname`; echo php=`which php`', $ssh_options);
+        if ($result === false) {
+            fwrite(STDERR, "\nCannot connect\n");
+            echo "Connection string examples: '$this->hostname', '$this->user@$this->hostname', '$this->user@$this->hostname:2222'\n";
+            return false;
+        }
+
+        echo "Connection is OK                 \n";
+
+        $variables = array('uname' => '', 'php' => '');
+        foreach (explode("\n", $result) as $ln) {
+            list($k, $v) = explode("=", $ln, 2);
+            $variables[$k] = $v;
+        }
+
+        if (!in_array($os = $variables['uname'], array('Linux', 'Darwin'))) {
+            fwrite(STDERR, "Remote OS '$result' is not supported, sorry\n");
+            return false;
+        }
+
+        if (!$variables['php']) {
+            $php_location = $this->ask(
+                'Where is PHP? Provide path to "php" binary',
+                '/usr/local/bin/php',
+                array($this, '_checkSSHBinary')
+            );
+        }
+
+        return true;
+    }
+
+    private function _checkSSHBinary($path)
+    {
+        $host = $this->tmp['host'];
+        $ssh_options = $this->tmp['ssh_options'];
+        $result = $this->ssh($host, escapeshellarg($path) . " --run 'echo PHP_SAPI;'", $ssh_options);
+        if ($result === false) return false;
+
+        if (trim($result) != "cli") {
+            fwrite(STDERR, "It is not PHP CLI binary ;)\n");
+            return false;
+        }
+
+        return true;
     }
 
     private function _configWizardSSH()
     {
-        $os = $username = $host = $port = $php_location = '';
-        $self = $this;
-
-        $this->ask(
-            "Remote SSH server address",
-            "",
-            function ($str) use (&$username, &$host, &$port, &$php_location, &$os, $self)
-            {
-                $os = $php_location = $username = $host = $port = '';
-                if (strpos($str, ":") !== false) {
-                    list($str, $port) = explode(":", $str, 2);
-                    if (!ctype_digit($port)) {
-                        fwrite(STDERR, "Port must be numeric\n");
-                        return false;
-                    }
-                }
-
-                if (strpos($str, "@") !== false) {
-                    list($username, $host) = explode("@", $str, 2);
-                } else {
-                    $host = $str;
-                }
-
-                $ssh_options = array('username' => $username, 'port' => $port);
-
-                echo "\rChecking connection...\r";
-                $result = $self->ssh($host, 'echo uname=`uname`; echo php=`which php`', $ssh_options);
-                if ($result === false) {
-                    fwrite(STDERR, "\nCannot connect\n");
-                    echo "Connection string examples: '$self->hostname', '$self->user@$self->hostname', '$self->user@$self->hostname:2222'\n";
-                    return false;
-                }
-
-                echo "Connection is OK                 \n";
-
-                $variables = array('uname' => '', 'php' => '');
-                foreach (explode("\n", $result) as $ln) {
-                    list($k, $v) = explode("=", $ln, 2);
-                    $variables[$k] = $v;
-                }
-
-                if (!in_array($os = $variables['uname'], array('Linux', 'Darwin'))) {
-                    fwrite(STDERR, "Remote OS '$result' is not supported, sorry\n");
-                    return false;
-                }
-
-                if (!$variables['php']) {
-                    $php_location = $self->ask(
-                        'Where is PHP? Provide path to "php" binary',
-                        '/usr/local/bin/php',
-                        function ($path) use ($self, $ssh_options, $host)
-                        {
-                            $result = $self->ssh($host, escapeshellarg($path) . " --run 'echo PHP_SAPI;'", $ssh_options);
-                            if ($result === false) return false;
-
-                            if (trim($result) != "cli") {
-                                fwrite(STDERR, "It is not PHP CLI binary ;)\n");
-                                return false;
-                            }
-
-                            return true;
-                        }
-                    );
-                }
-
-                return true;
-            }
-        );
-
-        return array('username' => $username, 'host' => $host, 'port' => $port, 'php' => $php_location, 'os' => $os);
+        $this->ask("Remote SSH server address", "", array($this, '_configWizardAskRemoteAddress'));
+        return $this->tmp;
     }
 
     private function _startLocalWatcher()
@@ -582,10 +593,6 @@ class Unrealsync
         $dir = rtrim($dir, '/');
         $repo_dir = $dir . '/' . self::REPO;
         $dir_esc = escapeshellarg($repo_dir);
-        echo "  Creating $repo_dir...";
-        $result = $this->ssh($host, "if [ ! -d $dir_esc ]; then exec mkdir $dir_esc; fi; exit 0", $data);
-        echo "done\n";
-        if ($result === false) throw new UnrealsyncException("Cannot create $dir for $srv");
         if (empty($data['os'])) {
             echo "Retrieving OS because it was not specified in config\n";
             $data['os'] = $this->ssh($host, "uname", $data);
@@ -595,15 +602,34 @@ class Unrealsync
         if (!in_array($data['os'], array('Linux', 'Darwin'))) throw new UnrealsyncException("Unsupported remote os '$data[os]' for $srv");
         echo "  Copying files...";
         $watcher_path = __DIR__ . '/bin/' . strtolower($data['os']) . '/notify';
-        $result = $this->scp($host, array(__FILE__, $watcher_path), $repo_dir . '/');
-        echo "done\n";
-        if ($result === false) throw new UnrealsyncException("Cannot scp unrealsync.php and watcher to $srv");
+        $php_bin = (!empty($data['php']) ? $data['php'] : 'php');
+        $cmd  = "if [ ! -d $dir_esc ]; then mkdir $dir_esc; fi; ";
+        $remote_files = array(__FILE__, $watcher_path);
+        foreach ($remote_files as $k => $f) {
+            $rf = escapeshellarg("$repo_dir/" . basename($f));
+            $cmd .= "if [ -f $rf ]; then $php_bin -r 'echo \"$k=\" . md5(file_get_contents(\"'$rf'\")) . \"\\n\";'; fi;";
+        }
+
+        $result = $this->ssh($host, $cmd, $data);
+        $lines = explode("\n", $result);
+        foreach ($lines as $ln) {
+            if (!$ln) continue;
+            list($idx, $rest) = explode("=", $ln, 2);
+            $local_md5 = md5(file_get_contents($remote_files[$idx]));
+            if (!preg_match('/[a-f0-9]{32}/s', $rest, $m)) continue;
+            if ($local_md5 === $m[0]) unset($remote_files[$idx]);
+        }
+
+        foreach ($remote_files as $f) {
+            $result = $this->scp($host, $f, $repo_dir . '/', $data);
+            if ($result === false) throw new UnrealsyncException("Cannot scp $f to $srv");
+        }
 
         echo "  Starting unrealsync server on $srv...";
 
         $result = $this->ssh(
             $host,
-            (!empty($data['php']) ? $data['php'] : 'php') . " " . escapeshellarg($repo_dir . '/' . basename(__FILE__)) . " --server",
+            $php_bin . " " . escapeshellarg($repo_dir . '/' . basename(__FILE__)) . " --server",
             $data + array('proc_open' => true)
         );
         if ($result === false) throw new UnrealsyncException("Cannot start unrealsync daemon on $srv");
