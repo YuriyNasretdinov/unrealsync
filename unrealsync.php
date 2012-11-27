@@ -272,14 +272,14 @@ class Unrealsync
             if (!strlen($answer)) $answer = $default;
             if (!$validation) return $answer;
 
-            if (is_array($validation)) {
+            if (is_callable($validation)) {
+                if (!call_user_func($validation, $answer)) continue;
+                return $answer;
+            } else if (is_array($validation)) {
                 if (!in_array($answer, $validation)) {
                     fwrite(STDERR, "Valid options are: " . implode(", ", $validation) . "\n");
                     continue;
                 }
-                return $answer;
-            } else if (is_callable($validation)) {
-                if (!call_user_func($validation, $answer)) continue;
                 return $answer;
             } else {
                 throw new UnrealsyncException("Internal error: Incorrect validation argument");
@@ -1348,9 +1348,11 @@ class Unrealsync
         foreach ($this->servers as $srv => $srv_data) {
             echo "Propagating merged changes to $srv\n";
             $this->_sync($srv, self::SYNC_FROM_LOCAL);
+            echo "  Committing changes at $srv...";
             if (!$this->_remoteExecute($srv, self::CMD_COMMIT)) {
                 throw new UnrealsyncException("Cannot commit changes at $srv");
             }
+            echo "done\n";
         }
 
         echo "Commiting local changes...";
