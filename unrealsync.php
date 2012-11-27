@@ -625,6 +625,8 @@ class Unrealsync
             if ($result === false) throw new UnrealsyncException("Cannot scp $f to $srv");
         }
 
+        echo "done\n";
+
         echo "  Starting unrealsync server on $srv...";
 
         $result = $this->ssh(
