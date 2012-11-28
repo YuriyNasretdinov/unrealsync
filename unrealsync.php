@@ -477,7 +477,7 @@ class Unrealsync
     {
         $binary = 'exec ' . __DIR__ . '/bin/' . $this->os . '/notify ';
         if ($this->os == self::OS_LIN) {
-            $binary .= 'watch .';
+            $binary .= 'watch ' . escapeshellarg(getcwd()); // linux notify util needs full path to directory *FACEPALM*
         } else if ($this->os == self::OS_MAC) {
             $binary .= '.';
         } else {
