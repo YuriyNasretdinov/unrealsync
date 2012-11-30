@@ -92,6 +92,8 @@ class Unrealsync
         '.' => true, '..' => true, '.unrealsync' => true
     );
 
+    var $onsync = false; // command executed upon successul sync
+
     private $lockfp = null;
     private $timers = array();
 
@@ -237,6 +239,9 @@ class Unrealsync
                 $this->exclude[$excl] = true;
             }
         }
+
+        if (!empty($core_settings['onsync'])) $this->onsync = $core_settings['onsync'];
+
         if (!count($config)) throw new UnrealsyncException("No server sections in $file");
         $this->servers = $config;
     }
@@ -1387,6 +1392,9 @@ class Unrealsync
                     $this->_commitDiff($diff, true);
                 }
                 $dir_hashes = array();
+
+                if ($this->onsync) $this->_directSystem("$this->onsync &");
+
                 continue;
             }
             /* turn changes in separate files into changes in directories for Mac OS X watcher compatibility */
