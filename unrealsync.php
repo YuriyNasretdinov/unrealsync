@@ -1390,10 +1390,9 @@ class Unrealsync
                 if (mb_orig_strlen($diff) > 0) {
                     foreach ($this->servers as $srv => $_) $this->_remoteExecute($srv, self::CMD_APPLY_DIFF, $diff);
                     $this->_commitDiff($diff, true);
+                    if ($this->onsync) $this->_directSystem("$this->onsync &");
                 }
                 $dir_hashes = array();
-
-                if ($this->onsync) $this->_directSystem("$this->onsync &");
 
                 continue;
             }
