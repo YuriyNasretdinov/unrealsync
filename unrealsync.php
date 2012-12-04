@@ -1378,7 +1378,7 @@ class Unrealsync
                         echo "diff size " . ($len > 1024 ? round($len / 1024) . " KiB" : $len . " bytes") . "\n";
                     } catch (UnrealsyncFileException $e) {
                         $have_errors = true;
-                        echo "Got an error during diff computation: " . $e->__toString() . "\n";
+                        echo "Got an error during diff computation: " . $e->getMessage() . "\n";
                     }
 
                     if (!$have_errors) break;
