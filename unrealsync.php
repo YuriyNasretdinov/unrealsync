@@ -481,9 +481,7 @@ class Unrealsync
     private function _startLocalWatcher()
     {
         $binary = 'exec ' . __DIR__ . '/bin/' . $this->os . '/notify ';
-        if ($this->os == self::OS_LIN) {
-            $binary .= 'watch ' . escapeshellarg(getcwd()); // linux notify util needs full path to directory *FACEPALM*
-        } else if ($this->os == self::OS_MAC) {
+        if ($this->os == self::OS_LIN || $this->os == self::OS_MAC) {
             $binary .= '.';
         } else {
             throw new UnrealsyncException("Start local watcher for $this->os is not yet implemented, sorry");
@@ -1043,7 +1041,7 @@ class Unrealsync
                 }
 
                 if ($stat === $rstat) {
-                    if ($stat === "dir" && $recursive) $this->_appendDiff($file, $diff);
+                    if ($stat === "dir" && $recursive) $this->_appendDiff($file, $diff, $include_contents, $recursive);
                     continue;
                 }
 
@@ -1362,10 +1360,13 @@ class Unrealsync
         echo "done\n";
         $dir_hashes = array();
 
+        $write = $except = array();
         while (false !== ($ln = fgets($this->watcher['pipe']))) {
 //            echo "Read $ln";
             $ln = rtrim($ln);
             if ($ln === "-") {
+                $read = array($this->watcher['pipe']);
+                if (stream_select($read, $write, $except, 0)) continue; // there is more in pipe, send later
                 $diff = '';
                 while (true) {
                     $have_errors = false;
@@ -1398,7 +1399,6 @@ class Unrealsync
             }
             /* turn changes in separate files into changes in directories for Mac OS X watcher compatibility */
             list(, $file) = explode(" ", $ln, 2);
-            if (is_link($file) || !is_dir($file)) $file = dirname($file);
             $dir_hashes[rtrim($file, "/")] = true;
         }
 
