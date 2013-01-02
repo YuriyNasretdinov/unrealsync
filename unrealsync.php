@@ -59,6 +59,9 @@ class Unrealsync
     const CMD_GET_FILES = 'getfiles';
     const CMD_COMMIT = "commit";
     const CMD_APPLY_DIFF = "applydiff";
+    const CMD_BIG_INIT = "biginit";
+    const CMD_CHUNK_RCV = "chunkrcv";
+    const CMD_BIG_COMMIT = "bigcommit";
 
     /* diff answers */
     const EMPTY_LOCAL  = "local\n";
@@ -68,6 +71,7 @@ class Unrealsync
     const MAX_MEMORY = 16777216; // max 16 Mb per read
     const MAX_CONFLICTS = 20;
 
+    const CONTENT_HEADER_LENGTH = 10;
     const SEPARATOR = "\n------------\n"; // separator for diff records
 
     var $os, $is_unix = false, $isatty = true, $is_debug = false;
@@ -100,6 +104,10 @@ class Unrealsync
     private $finished = false;
     private $tmp;
 
+    private $diff = ""; // current diff
+    private $chunk_filename = "", $chunk_tmp_filename = "", $chunk_fp;
+    private $had_changes = false;
+
     function init($argv)
     {
         unset($argv[0]);
@@ -112,7 +120,7 @@ class Unrealsync
 
         if ($argv) {
             fwrite(STDERR, "Unrecognized parameters: " . implode(", ", $argv) . "\n");
-            fwrite(STDERR, "Usage: unrealsync.php [--server]\n");
+            fwrite(STDERR, "Usage: unrealsync.php [--debug]\n");
             exit(1);
         }
 
@@ -406,7 +414,7 @@ class Unrealsync
     {
         $os = $php_location = $username = $host = $port = '';
         $this->tmp = array(
-            'os' => &$os, 'php_location' => &$php_location, 'username' => &$username, 'host' => &$host, 'port' => &$port
+            'os' => &$os, 'php' => &$php_location, 'username' => &$username, 'host' => &$host, 'port' => &$port
         );
 
         if (strpos($str, ":") !== false) {
@@ -447,7 +455,7 @@ class Unrealsync
         }
 
         if (!$variables['php']) {
-            $php_location = $this->ask(
+            $this->tmp['php'] = $this->ask(
                 'Where is PHP? Provide path to "php" binary',
                 '/usr/local/bin/php',
                 array($this, '_checkSSHBinary')
@@ -562,6 +570,11 @@ class Unrealsync
         }
     }
 
+    private function _remoteExecuteAll($cmd, $data = null)
+    {
+        foreach ($this->remotes as $srv => $_) $this->_remoteExecute($srv, $cmd, $data);
+    }
+
     private function _remoteExecute($srv, $cmd, $data = null)
     {
         if (!$this->remotes[$srv]) throw new UnrealsyncException("Incorrect remote server $srv");
@@ -572,7 +585,7 @@ class Unrealsync
 //        $this->debug("Remote execute of '$cmd' on $srv with data '" . mb_orig_substr($data, 0, 100)  . "'");
         $this->_fullWrite($write_pipe, sprintf("%10s%10u%s", $cmd, mb_orig_strlen($data), $data), $srv);
 //        $this->debug("Receiving response from $srv");
-        $len = intval($this->_fullRead($read_pipe, 10, $srv));
+        $len = intval($this->_fullRead($read_pipe, self::CONTENT_HEADER_LENGTH, $srv));
         $this->_timerStop("$srv: exec $cmd");
         $this->_timerStart();
         $result = $this->_fullRead($read_pipe, $len, $srv);
@@ -638,18 +651,7 @@ class Unrealsync
         if ($this->_remoteExecute($srv, self::CMD_PING) != "pong") {
             throw new UnrealsyncException("Ping failed. Something went wrong.");
         }
-
-        echo "  Getting remote diff from $srv...";
-        $remote_diff = $this->_remoteExecute($srv, self::CMD_DIFF);
-        echo "done\n";
-        if (substr($remote_diff, 0, mb_orig_strlen(self::EMPTY_HEADER)) === self::EMPTY_HEADER) {
-            $this->_handleEmpty($srv, $remote_diff);
-        } else {
-//            $this->_applyRemoteDiff($srv, $remote_diff);
-            echo "Diff from $srv was not applied (not implemented yet)\n";
-        }
     }
-
 
     private function _timerStart($msg = null)
     {
@@ -789,9 +791,9 @@ class Unrealsync
                 else list ($oldstat, $diffstat) = explode("\n\n", $chunk);
 
                 if ($diffstat !== "dir" && strpos($diffstat, "symlink=") === false) {
-                    $length = intval(mb_orig_substr($diff, $offset, 10));
+                    $length = intval(mb_orig_substr($diff, $offset, self::CONTENT_HEADER_LENGTH));
                     if ($length > self::MAX_MEMORY) throw new UnrealsyncException("Too big file, probably commucation error");
-                    $offset += 10;
+                    $offset += self::CONTENT_HEADER_LENGTH;
                     $contents = mb_orig_substr($diff, $offset, $length);
                     $offset += $length;
                 }
@@ -857,7 +859,7 @@ class Unrealsync
             if ($answer === 't') $recv_list .= $conf_list;
         }
 
-        $this->_commitDiff($diff, true);
+        $this->_commitDiff($diff);
         $this->debug("Peak memory: " . memory_get_peak_usage(true));
     }
 
@@ -996,22 +998,95 @@ class Unrealsync
         if ($empty) return self::EMPTY_HEADER . $empty;
 
         $diff = "";
-        $this->_appendDiff(".", $diff);
+        $this->_appendDiff(".");
         return $diff;
     }
 
-    private function _appendContents($file, $stat, &$diff)
+    private function _appendContents($file, $stat)
     {
-        if (strpos($stat, "symlink=") !== false) return;
+        if (mb_orig_strpos($stat, "symlink=") !== false) return;
         $contents = file_get_contents($file);
         if ($contents === false) throw new UnrealsyncFileException("Cannot read $file");
         $size = $this->_getSizeFromStat($stat);
         if (mb_orig_strlen($contents) != $size) throw new UnrealsyncFileException("Actual file size does not match stat");
-        $diff .= sprintf("%10u", $size);
-        $diff .= $contents;
+        $this->diff .= sprintf("%10u", $size);
+        $this->diff .= $contents;
     }
 
-    private function _appendDiff($dir, &$diff, $include_contents = false, $recursive = true)
+    /* Prevent from having too big diff that exceeds MAX_MEMORY
+       If TRUE is returned then file is very big and it's processing must be skipped
+    */
+    private function _optimizeSendBuffers($diff_str, $file, $stat)
+    {
+        if (!mb_orig_strlen($stat)) $sz = 0;
+        else $sz = $this->_getSizeFromStat($stat) + self::CONTENT_HEADER_LENGTH;
+
+        if (mb_orig_strlen($diff_str) + $sz >= self::MAX_MEMORY) {
+            $this->_sendBigFile($file);
+            return true;
+        } else if (mb_orig_strlen($diff_str) + mb_orig_strlen($this->diff) + $sz >= self::MAX_MEMORY) {
+            $this->_sendAndCommitDiff();
+        }
+        return false;
+    }
+
+    private function _cmdBigInit($filename)
+    {
+        $this->chunk_filename = $filename;
+        $this->chunk_tmp_filename = self::REPO_TMP . "/" . basename($filename);
+        $this->chunk_fp = fopen($this->chunk_tmp_filename, "w");
+        if (!$this->chunk_fp) throw new UnrealsyncException("Cannot open temporary file for chunk");
+        return true;
+    }
+
+    private function _cmdChunkRcv($chunk)
+    {
+        if (fwrite($this->chunk_fp, $chunk) !== mb_orig_strlen($chunk)) {
+            throw new UnrealsyncException("Could not write chunk");
+        }
+
+        return true;
+    }
+
+    private function _cmdBigCommit()
+    {
+        if (!fclose($this->chunk_fp)) {
+            throw new UnrealsyncException("Could not fclose() chunk file pointer");
+        }
+        if (!rename($this->chunk_tmp_filename, $this->chunk_filename)) {
+            throw new UnrealsyncException("Could not move $this->chunk_filename");
+        }
+        if (!$this->_commit($this->chunk_filename)) {
+            throw new UnrealsyncException("Could not commit $this->chunk_filename");
+        }
+
+        return true;
+    }
+
+    private function _sendBigFile($file)
+    {
+        $stat = $this->_stat($file);
+        if (!$stat) throw new UnrealsyncFileException("File vanished: $file");
+        $sz = $this->_getSizeFromStat($stat);
+        if (!$sz) throw new UnrealsyncException("Internal error: no size for big file");
+
+        $fp = fopen($file, "rb");
+        if (!$fp) throw new UnrealsyncFileException("Could not open big file $file for reading");
+        fwrite(STDERR, "$this->hostname\$ Sending big file $file (" . round($sz / 1024) . " KiB)...");
+
+        $this->_remoteExecuteAll(self::CMD_BIG_INIT, $file);
+        while (mb_orig_strlen($chunk = fread($fp, self::MAX_MEMORY / 2))) {
+            $this->_remoteExecuteAll(self::CMD_CHUNK_RCV, $chunk);
+            fwrite(STDERR, ".");
+        }
+
+        fclose($fp);
+        $this->_remoteExecuteAll(self::CMD_BIG_COMMIT);
+
+        fwrite(STDERR, "done\n");
+    }
+
+    private function _appendDiff($dir, $recursive = true)
     {
         // if we cannot open directory, it means that it vanished during diff computation. It is actually acceptable
         @$dh = opendir($dir);
@@ -1029,27 +1104,25 @@ class Unrealsync
 
                 if (!$rstat) {
                     if ($stat === "dir") {
-                        $this->_appendAddedFiles($file, $diff, $include_contents);
+                        $this->_appendAddedFiles($file);
                     } else {
-//                        fwrite(STDERR, "File added: $file\n");
                         $str = "A $file\n$stat" . self::SEPARATOR;
-                        $this->debug($str);
-                        $diff .= $str;
-                        if ($include_contents) $this->_appendContents($file, $stat, $diff);
+                        if ($this->_optimizeSendBuffers($str, $file, $stat)) continue;
+                        $this->diff .= $str;
+                        $this->_appendContents($file, $stat);
                     }
                     continue;
                 }
 
                 if ($stat === $rstat) {
-                    if ($stat === "dir" && $recursive) $this->_appendDiff($file, $diff, $include_contents, $recursive);
+                    if ($stat === "dir" && $recursive) $this->_appendDiff($file, $recursive);
                     continue;
                 }
 
-//                fwrite(STDERR, "File changed: $file\n");
                 $str = "M $file\n$rstat\n\n$stat" . self::SEPARATOR;
-                $this->debug($str);
-                $diff .= $str;
-                if ($include_contents) $this->_appendContents($file, $stat, $diff);
+                if ($this->_optimizeSendBuffers($str, $file, $stat)) continue;
+                $this->diff .= $str;
+                $this->_appendContents($file, $stat);
             }
         } catch (Exception $e) {
             closedir($dh);
@@ -1065,27 +1138,27 @@ class Unrealsync
             while (false !== ($rel_path = readdir($dh))) {
                 if ($rel_path === "." || $rel_path === "..") continue;
                 $file = "$dir/$rel_path";
-                if (isset($files[$file])) continue;
-
+                if (mb_orig_strlen($this->_stat($file)) > 0) continue;
                 $rstat = $this->_rstat($file);
-//                fwrite(STDERR, "File deleted: $file\n");
                 $str = "D $file\n$rstat" . self::SEPARATOR;
-                $this->debug($str);
-                $diff .= $str;
+                $this->_optimizeSendBuffers($str, $file, "");
+                $this->diff .= $str;
             }
             closedir($dh);
         }
     }
 
-    private function _appendAddedFiles($dir, &$diff, $include_contents = false)
+    private function _appendAddedFiles($dir)
     {
         @$dh = opendir($dir);
         if (!$dh) {
             $this->debug("_appendAddedFiles: cannot opendir($dir)");
             return;
         }
-//        fwrite(STDERR, "Dir added: $dir\n");
-        $diff .= "A $dir\ndir" . self::SEPARATOR;
+
+        $str = "A $dir\ndir" . self::SEPARATOR;
+        $this->_optimizeSendBuffers($str, $dir, "");
+        $this->diff .= $str;
 
         while (false !== ($rel_path = readdir($dh))) {
             if (isset($this->exclude[$rel_path])) continue;
@@ -1097,11 +1170,12 @@ class Unrealsync
             }
 
             if ($stat === "dir") {
-                $this->_appendAddedFiles($file, $diff, $include_contents);
+                $this->_appendAddedFiles($file);
             } else {
-//                fwrite(STDERR, "File added: $file\n");
-                $diff .= "A $file\n$stat" . self::SEPARATOR;
-                if ($include_contents) $this->_appendContents($file, $stat, $diff);
+                $str = "A $file\n$stat" . self::SEPARATOR;
+                if ($this->_optimizeSendBuffers($str, $file, $stat)) continue;
+                $this->diff .= $str;
+                $this->_appendContents($file, $stat);
             }
         }
         closedir($dh);
@@ -1114,6 +1188,8 @@ class Unrealsync
 
     private function _getSizeFromStat($stat)
     {
+        if (mb_orig_strpos($stat, "symlink=") !== false) return 0;
+
         $offset = mb_orig_strpos($stat, "size=") + 5;
         return mb_orig_substr($stat, $offset, mb_orig_strpos($stat, "\n", $offset) - $offset);
     }
@@ -1204,15 +1280,15 @@ class Unrealsync
     }
 
     /* Commit changes that were sent in $diff */
-    private function _commitDiff($diff, $with_contents = false)
+    private function _commitDiff()
     {
         $offset = 0;
 
 //        fwrite(STDERR, "$this->hostname\$ committing diff\n");
 
         while (true) {
-            if (($end_pos = mb_orig_strpos($diff, self::SEPARATOR, $offset)) === false) break;
-            $chunk = mb_orig_substr($diff, $offset, $end_pos - $offset);
+            if (($end_pos = mb_orig_strpos($this->diff, self::SEPARATOR, $offset)) === false) break;
+            $chunk = mb_orig_substr($this->diff, $offset, $end_pos - $offset);
             $offset = $end_pos + mb_orig_strlen(self::SEPARATOR);
             $op = $chunk[0];
             $first_line_pos = mb_orig_strpos($chunk, "\n");
@@ -1227,11 +1303,9 @@ class Unrealsync
                 if ($op === 'A') $diffstat = $chunk;
                 else list ($oldstat, $diffstat) = explode("\n\n", $chunk);
 
-                if ($with_contents) {
-                    if ($diffstat !== "dir" && strpos($diffstat, "symlink=") === false) {
-                        $length = intval(mb_orig_substr($diff, $offset, 10));
-                        $offset += 10 + $length;
-                    }
+                if ($diffstat !== "dir" && strpos($diffstat, "symlink=") === false) {
+                    $length = intval(mb_orig_substr($this->diff, $offset, self::CONTENT_HEADER_LENGTH));
+                    $offset += self::CONTENT_HEADER_LENGTH + $length;
                 }
 
 //                fwrite(STDERR, "$this->hostname\$ $op $file\n");
@@ -1267,12 +1341,25 @@ class Unrealsync
         return rmdir($path);
     }
 
-    private function _getDirsDiff($dirs)
+    private function _sendAndCommitDiff()
     {
-        $diff = "";
-        foreach ($dirs as $dir) $this->_appendDiff($dir, $diff, true, false);
-        if ($this->is_debug) file_put_contents("/tmp/unrealsync", $diff, FILE_APPEND);
-        return $diff;
+        if ($this->is_server) throw new UnrealsyncException("Send and commit diff is not implemented on server");
+        if (!$len = mb_orig_strlen($this->diff)) return;
+        $this->had_changes = true;
+        echo "diff size " . ($len > 1024 ? round($len / 1024) . " KiB" : $len . " bytes") . "\n";
+
+        $this->_remoteExecuteAll(self::CMD_APPLY_DIFF, $this->diff);
+        $this->_commitDiff();
+        $this->diff = "";
+    }
+
+    private function _sendDirsDiff($dirs)
+    {
+        $this->had_changes = false;
+        echo "\nChanged dirs: " . implode(" ", $dirs) . "\n";
+        foreach ($dirs as $dir) $this->_appendDiff($dir, false);
+
+        if (mb_orig_strlen($this->diff) > 0) $this->_sendAndCommitDiff();
     }
 
     private function _cmdApplyDiff($diff)
@@ -1315,8 +1402,8 @@ class Unrealsync
     function runServer()
     {
         while (true) {
-            $cmd = trim($this->_fullRead(STDIN, 10));
-            $len = intval($this->_fullRead(STDIN, 10));
+            $cmd = trim($this->_fullRead(STDIN, self::CONTENT_HEADER_LENGTH));
+            $len = intval($this->_fullRead(STDIN, self::CONTENT_HEADER_LENGTH));
             $data = $this->_fullRead(STDIN, $len);
 
             if ($cmd !== self::CMD_SHUTDOWN) {
@@ -1367,32 +1454,26 @@ class Unrealsync
             if ($ln === "-") {
                 $read = array($this->watcher['pipe']);
                 if (stream_select($read, $write, $except, 0)) continue; // there is more in pipe, send later
-                $diff = '';
                 while (true) {
+                    $this->diff = "";
                     $have_errors = false;
                     $dirs = $this->_getFilteredDirs(array_keys($dir_hashes));
                     if (!$dirs) break;
                     try {
-                        echo "\nChanged dirs: " . implode(" ", $dirs) . "\n";
-                        $diff = $this->_getDirsDiff($dirs);
-                        $len = mb_orig_strlen($diff);
-                        echo "diff size " . ($len > 1024 ? round($len / 1024) . " KiB" : $len . " bytes") . "\n";
+                        $this->_sendDirsDiff($dirs);
                     } catch (UnrealsyncFileException $e) {
                         $have_errors = true;
-                        echo "Got an error during diff computation: " . $e->getMessage() . "\n";
+                        fwrite(STDERR, "Got an error during diff computation: " . $e->getMessage() . "\n");
                     }
 
                     if (!$have_errors) break;
 
-                    echo "Got errors during diff computation. Waiting 1s to try again\n";
+                    fwrite(STDERR, "Got errors during diff computation. Waiting 1s to try again\n");
                     sleep(1);
                 }
 
-                if (mb_orig_strlen($diff) > 0) {
-                    foreach ($this->servers as $srv => $_) $this->_remoteExecute($srv, self::CMD_APPLY_DIFF, $diff);
-                    $this->_commitDiff($diff, true);
-                    if ($this->onsync) $this->_directSystem("$this->onsync &");
-                }
+                if ($this->had_changes && $this->onsync) $this->_directSystem("$this->onsync &");
+                $this->had_changes = false;
                 $dir_hashes = array();
 
                 continue;
