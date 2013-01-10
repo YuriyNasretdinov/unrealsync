@@ -1049,7 +1049,7 @@ class Unrealsync
         return true;
     }
 
-    private function _cmdBigCommit()
+    private function _cmdBigCommit($stat)
     {
         if (!fclose($this->chunk_fp)) {
             throw new UnrealsyncException("Could not fclose() chunk file pointer");
@@ -1057,7 +1057,7 @@ class Unrealsync
         if (!rename($this->chunk_tmp_filename, $this->chunk_filename)) {
             throw new UnrealsyncException("Could not move $this->chunk_filename");
         }
-        if (!$this->_commit($this->chunk_filename)) {
+        if (!$this->_commit($this->chunk_filename, $stat)) {
             throw new UnrealsyncException("Could not commit $this->chunk_filename");
         }
 
@@ -1102,7 +1102,8 @@ class Unrealsync
         }
 
         fclose($fp);
-        $this->_remoteExecuteAll(self::CMD_BIG_COMMIT);
+        $this->_remoteExecuteAll(self::CMD_BIG_COMMIT, $stat);
+        $this->_commit($file, $stat);
 
         fwrite(STDERR, "done\n");
     }
