@@ -62,6 +62,7 @@ class Unrealsync
     const CMD_BIG_INIT = "biginit";
     const CMD_CHUNK_RCV = "chunkrcv";
     const CMD_BIG_COMMIT = "bigcommit";
+    const CMD_BIG_ABORT = "bigabort";
 
     /* diff answers */
     const EMPTY_LOCAL  = "local\n";
@@ -1063,10 +1064,24 @@ class Unrealsync
         return true;
     }
 
+    private function _cmdBigAbort()
+    {
+        if (!fclose($this->chunk_fp)) {
+            throw new UnrealsyncException("Could not fclose() chunk file pointer");
+        }
+        if (!unlink($this->chunk_tmp_filename)) {
+            throw new UnrealsyncException("Could not unlink $this->chunk_filename");
+        }
+        return true;
+    }
+
     private function _sendBigFile($file)
     {
         $stat = $this->_stat($file);
         if (!$stat) throw new UnrealsyncFileException("File vanished: $file");
+        $rstat = $this->_rstat($file);
+        if ($stat === $rstat) return;
+
         $sz = $this->_getSizeFromStat($stat);
         if (!$sz) throw new UnrealsyncException("Internal error: no size for big file");
 
@@ -1076,6 +1091,12 @@ class Unrealsync
 
         $this->_remoteExecuteAll(self::CMD_BIG_INIT, $file);
         while (mb_orig_strlen($chunk = fread($fp, self::MAX_MEMORY / 2))) {
+            if ($stat !== $this->_stat($file)) {
+                fwrite(STDERR, "file changed, aborting\n");
+                $this->_remoteExecuteAll(self::CMD_BIG_ABORT);
+                fclose($fp);
+                return;
+            }
             $this->_remoteExecuteAll(self::CMD_CHUNK_RCV, $chunk);
             fwrite(STDERR, ".");
         }
