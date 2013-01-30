@@ -726,7 +726,11 @@ class Unrealsync
     {
         if (!$sync_direction) $sync_direction = $this->_askSyncDirection($srv);
 
-        $rsync_cmd = "rsync -a --delete --exclude=" . self::REPO . " ";
+        $rsync_cmd = "rsync -a --delete ";
+        foreach ($this->exclude as $excl => $_) {
+            if ($excl == '.' || $excl == '..') continue;
+            $rsync_cmd .= "--exclude=" . escapeshellarg($excl) . " ";
+        }
         $remote_arg = escapeshellarg($this->servers[$srv]['host'] . ":" . rtrim($this->servers[$srv]['dir'], "/") . "/");
         switch ($sync_direction) {
             case self::SYNC_FROM_LOCAL:
