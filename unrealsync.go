@@ -75,7 +75,7 @@ func (p UnrealStat) Serialize() (res string) {
 		res += "symlink "
 	}
 
-	res += fmt.Sprint("mode=", p.mode, " mtime=", p.mtime, " size=", p.size)
+	res += fmt.Sprintf("mode=%o mtime=%d size=%v", p.mode, p.mtime, p.size)
 	return
 }
 
@@ -115,7 +115,7 @@ func UnrealStatUnserialize(input string) (result UnrealStat) {
 		} else if part == "symlink" {
 			result.is_link = true
 		} else if strings.HasPrefix(part, "mode=") {
-			tmp, _ := strconv.ParseInt(part[len("mode="):], 10, 16)
+			tmp, _ := strconv.ParseInt(part[len("mode="):], 8, 16)
 			result.mode = int16(tmp)
 		} else if strings.HasPrefix(part, "mtime=") {
 			result.mtime, _ = strconv.ParseInt(part[len("mtime="):], 10, 64)
@@ -203,8 +203,6 @@ func parseConfig() {
 	if general["exclude"] != "" {
 		excludes = parseExcludes(general["exclude"])
 	}
-	excludes["."] = true
-	excludes[".."] = true
 
 	delete(dict, GENERAL_SECTION)
 
@@ -307,9 +305,9 @@ func writeRepoInfo(dir string, info_map map[string]UnrealStat) {
 	for k, v := range old_info_map {
 		_, ok := info_map[k]
 		if !ok && v.is_dir {
-			err := os.RemoveAll(dir + "/" + k)
+			err := os.RemoveAll(repo_dir + "/" + k)
 			if err != nil {
-				progressLn("Cannot delete ", dir, "/", k, ": ", err)
+				progressLn("Cannot delete ", repo_dir, "/", k, ": ", err)
 				return
 			}
 		}
@@ -351,10 +349,6 @@ func getRepoInfo(dir string) (result map[string]UnrealStat) {
 }
 
 func shouldIgnore(path string) bool {
-	if path == "." {
-		return false
-	}
-
 	for _, part := range strings.Split(path, "/") {
 		if part == "" {
 			continue
