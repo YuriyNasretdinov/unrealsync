@@ -1,18 +1,18 @@
 package main
 
 import (
-	"fmt"
 	"flag"
-	"os"
-	"log"
+	"fmt"
 	ini "github.com/glacjay/goini"
-	"strings"
-	"strconv"
+	"io"
+	"io/ioutil"
+	"log"
+	"os"
 	"path"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
-	"io/ioutil"
-	"io"
 )
 
 type Settings struct {
@@ -23,7 +23,7 @@ type Settings struct {
 	port     int
 
 	dir string
-	os string
+	os  string
 }
 
 type Diff struct {
@@ -41,27 +41,29 @@ type UnrealStat struct {
 
 const (
 	ERROR_RECOVERABLE = 1
-	ERROR_FATAL = 2
+	ERROR_FATAL       = 2
 
 	GENERAL_SECTION = "general_settings"
 
-	REPO_DIR = ".unrealsync/"
+	REPO_DIR           = ".unrealsync/"
 	REPO_CLIENT_CONFIG = REPO_DIR + "client_config"
 	REPO_SERVER_CONFIG = REPO_DIR + "server_config"
-	REPO_FILES = REPO_DIR + "files/"
-	REPO_TMP = REPO_DIR + "tmp/"
-	REPO_LOCK = REPO_DIR + "lock"
+	REPO_FILES         = REPO_DIR + "files/"
+	REPO_TMP           = REPO_DIR + "tmp/"
+	REPO_LOCK          = REPO_DIR + "lock"
+
+	REPO_SEP = "/\n"
 
 	DB_FILE = "Unreal.db"
 )
 
 var (
-	source_dir string
+	source_dir     string
 	unrealsync_dir string
-	fschanges = make(chan string, 1000)
-	dirschan = make(chan string, 100)
-	excludes = map[string]bool{}
-	servers = map[string]Settings{}
+	fschanges      = make(chan string, 1000)
+	dirschan       = make(chan string, 1000)
+	excludes       = map[string]bool{}
+	servers        = map[string]Settings{}
 )
 
 func (p UnrealStat) Serialize() (res string) {
@@ -83,12 +85,12 @@ func StatsEqual(orig os.FileInfo, repo UnrealStat) bool {
 		return false
 	}
 
-	if (repo.mode & 0777) != int16(uint32(orig.Mode()) & 0777) {
+	if (repo.mode & 0777) != int16(uint32(orig.Mode())&0777) {
 		progressLn(orig.Name(), " modes different")
 		return false
 	}
 
-	if repo.is_link != (orig.Mode() & os.ModeSymlink == os.ModeSymlink) {
+	if repo.is_link != (orig.Mode()&os.ModeSymlink == os.ModeSymlink) {
 		progressLn(orig.Name(), " symlinks different")
 		return false
 	}
@@ -159,7 +161,7 @@ func parseServerSettings(section string, server_settings map[string]string) Sett
 
 	var (
 		port int = 0
-		err error
+		err  error
 	)
 
 	if server_settings["port"] != "" {
@@ -256,23 +258,26 @@ func initialize() {
 }
 
 func syncThread() {
+	all_dirs := make(map[string]bool)
 	for {
-		all_dirs := make(map[string]bool)
 		for len(dirschan) > 0 {
 			all_dirs[<-dirschan] = true
 		}
 
-		if len(all_dirs) > 0 {
-			sync(all_dirs)
+		if len(all_dirs) > 0 && sync(all_dirs) {
+			continue
 		}
 
 		time.Sleep(time.Millisecond * 100)
+		all_dirs = make(map[string]bool)
 	}
 }
 
 func writeRepoInfo(dir string, info_map map[string]UnrealStat) {
 
-//	progressLn("Commiting changes at ", dir)
+	progressLn("Commiting changes at ", dir)
+
+	old_info_map := getRepoInfo(dir)
 
 	repo_dir := REPO_FILES + dir
 	err := os.MkdirAll(repo_dir, 0777)
@@ -282,23 +287,35 @@ func writeRepoInfo(dir string, info_map map[string]UnrealStat) {
 	}
 
 	filename := repo_dir + "/" + DB_FILE
-	fp, err := os.OpenFile(filename, os.O_CREATE | os.O_TRUNC | os.O_RDWR, 0666)
+	fp, err := os.OpenFile(filename, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0666)
 	if err != nil {
 		progressLn("Cannot open ", filename, " for writing: ", err)
 		return
 	}
 	defer fp.Close()
 
-	result := make([]string, len(info_map) * 2)
+	result := make([]string, len(info_map)*2)
 
 	i := 0
 	for k, v := range info_map {
 		result[i] = k
-		result[i + 1] = v.Serialize()
+		result[i+1] = v.Serialize()
 		i += 2
 	}
 
-	_, err = fp.WriteString(strings.Join(result, "/"))
+	// Delete deleted directories ;)
+	for k, v := range old_info_map {
+		_, ok := info_map[k]
+		if !ok && v.is_dir {
+			err := os.RemoveAll(dir + "/" + k)
+			if err != nil {
+				progressLn("Cannot delete ", dir, "/", k, ": ", err)
+				return
+			}
+		}
+	}
+
+	_, err = fp.WriteString(strings.Join(result, REPO_SEP))
 	if err != nil {
 		progressLn("Cannot write to ", filename, ": ", err)
 	}
@@ -309,31 +326,31 @@ func getRepoInfo(dir string) (result map[string]UnrealStat) {
 	filename := REPO_FILES + dir + "/" + DB_FILE
 	fp, err := os.Open(filename)
 	if err != nil {
-//		progressLn("Cannot open ", filename, ": ", err)
+		// progressLn("Cannot open ", filename, ": ", err)
 		return
 	}
 	defer fp.Close()
 
 	contents, err := ioutil.ReadAll(fp)
 	if err != nil {
-//		progressLn("Cannot read ", filename, ": ", err)
+		// progressLn("Cannot read ", filename, ": ", err)
 		return
 	}
 
-	elements := strings.Split(string(contents), "/")
+	elements := strings.Split(string(contents), REPO_SEP)
 
-	if len(elements) == 0 || len(elements) % 2 != 0 {
+	if len(elements) == 0 || len(elements)%2 != 0 {
 		log.Fatal("Broken repository file (inconstent data): " + filename)
 	}
 
 	for i := 0; i < len(elements); i += 2 {
-		result[elements[i]] = UnrealStatUnserialize(elements[i + 1])
+		result[elements[i]] = UnrealStatUnserialize(elements[i+1])
 	}
 
 	return
 }
 
-func shouldIgnore (path string) bool {
+func shouldIgnore(path string) bool {
 	if path == "." {
 		return false
 	}
@@ -344,7 +361,7 @@ func shouldIgnore (path string) bool {
 		}
 
 		if excludes[part] {
-//			progressLn("Ignored: ", path)
+			// progressLn("Ignored: ", path)
 			return true
 		}
 	}
@@ -353,8 +370,6 @@ func shouldIgnore (path string) bool {
 }
 
 func syncDir(dir string, recursive bool) (unreal_err int) {
-
-	// TODO: support recursive as well
 
 	if shouldIgnore(dir) {
 		return
@@ -383,6 +398,7 @@ func syncDir(dir string, recursive bool) (unreal_err int) {
 	}
 
 	repo_info := getRepoInfo(dir)
+	changes_count := 0
 
 	for {
 		res, err := fp.Readdir(10)
@@ -402,32 +418,60 @@ func syncDir(dir string, recursive bool) (unreal_err int) {
 			}
 			repo_el, ok := repo_info[info.Name()]
 			if !ok || !StatsEqual(info, repo_el) {
+
+				if info.IsDir() && (recursive || !ok || !repo_el.is_dir) {
+					unreal_err = syncDir(dir+"/"+info.Name(), true)
+					if unreal_err > 0 {
+						return
+					}
+				}
+
 				repo_info[info.Name()] = UnrealStat{
 					info.IsDir(),
-					(info.Mode() & os.ModeSymlink == os.ModeSymlink),
+					(info.Mode()&os.ModeSymlink == os.ModeSymlink),
 					int16(uint32(info.Mode()) & 0777),
 					info.ModTime().Unix(),
 					info.Size(),
 				}
 
-				progressLn("Changed: ", dir, "/", info.Name())
+				prefix := "Changed: "
+				if !ok {
+					prefix = "Added: "
+				}
+				progressLn(prefix, dir, "/", info.Name())
+				progressLn("Should send file using network")
 
-				// TODO: add whole directories when they do not exist
-				// TODO: should actually send files as well ;)
-
-				progressLn("Pretending to send file using network ;)")
+				changes_count++
 			}
 		}
-
-		// TODO: should check for file deletions
 	}
 
-	writeRepoInfo(dir, repo_info)
+	// Detect deletions
+	for name, _ := range repo_info {
+		_, err := os.Lstat(dir + "/" + name)
+		if os.IsNotExist(err) {
+			delete(repo_info, name)
+
+			progressLn("Deleted: ", dir, "/", name)
+			progressLn("Should delete file using network")
+
+			changes_count++
+		} else if err != nil {
+			progressLn("Could not lstat ", dir, "/", name, ": ", err)
+			unreal_err = ERROR_FATAL // we do not want to try to recover from Permission denied and other weird errors
+			return
+		}
+	}
+
+	if changes_count > 0 {
+		// network commit
+		writeRepoInfo(dir, repo_info)
+	}
 
 	return
 }
 
-func sync(dirs map[string]bool) {
+func sync(dirs map[string]bool) (should_retry bool) {
 	i := 0
 	dirs_list := make([]string, len(dirs))
 	for dir := range dirs {
@@ -445,28 +489,25 @@ func sync(dirs map[string]bool) {
 
 	progressLn("Changed dirs: ", strings.Join(dirs_list, "; "))
 
-	success := false
-	for !success {
-		for dir := range dirs {
-			// Upon receiving event we can have 'dir' vanish or become a file
-			// We should not even try to process them
-			stat, err := os.Lstat(dir)
-			if err != nil || !stat.IsDir() {
-				delete(dirs, dir)
-				continue
-			}
-			unreal_err := syncDir(dir, false)
-			if unreal_err == ERROR_RECOVERABLE {
-				progressLn("Got recoverable error, trying again in a second")
-				time.Sleep(time.Second)
-				break
-			} else if unreal_err == ERROR_FATAL {
-				log.Fatal("Unrecoverable error, exiting (this should never happen! please file a bug report)")
-			}
+	for dir := range dirs {
+		// Upon receiving event we can have 'dir' vanish or become a file
+		// We should not even try to process them
+		stat, err := os.Lstat(dir)
+		if err != nil || !stat.IsDir() {
+			delete(dirs, dir)
+			continue
 		}
-
-		success = true
+		unreal_err := syncDir(dir, false)
+		if unreal_err == ERROR_RECOVERABLE {
+			progressLn("Got recoverable error, trying again in a bit")
+			should_retry = true
+			return
+		} else if unreal_err == ERROR_FATAL {
+			log.Fatal("Unrecoverable error, exiting (this should never happen! please file a bug report)")
+		}
 	}
+
+	return
 }
 
 func main() {
