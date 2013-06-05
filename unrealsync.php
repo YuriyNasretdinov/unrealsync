@@ -69,7 +69,7 @@ class Unrealsync
     const EMPTY_REPO   = "repo\n";
     const EMPTY_HEADER = "EMPTY:";
 
-    const MAX_MEMORY = 16777216; // max 16 Mb per read
+    const MAX_MEMORY = 2097152; // max 2 Mb per read
     const MAX_CONFLICTS = 20;
 
     const CONTENT_HEADER_LENGTH = 10;
@@ -635,8 +635,6 @@ class Unrealsync
             if ($result === false) throw new UnrealsyncException("Cannot scp $f to $srv");
         }
 
-        echo "done\n";
-
         echo "  Starting unrealsync server on $srv...";
 
         $result = $this->ssh(
@@ -763,11 +761,10 @@ class Unrealsync
     /* go through remote diff, apply diff and report about conflicts
        if $with_contents = true, then diff with contents is expected and any conflicts are ignored
      */
-    private function _applyRemoteDiff($srv, $diff)
+    private function _applyRemoteDiff($diff)
     {
         fwrite(STDERR, "$this->hostname\$  Applying remote diff: ");
         $this->_timerStart();
-        $ignore_conflicts = true;
         $offset = 0;
         $stats = array('A' => 0, 'D' => 0, 'M' => 0);
         // We do not use explode() in order to save memory, because we need about 3 times more memory for our case
@@ -786,10 +783,8 @@ class Unrealsync
             $first_line = mb_orig_substr($chunk, 0, $first_line_pos);
             $file = mb_orig_substr($first_line, 2);
             if (!$file) throw new UnrealsyncException("No filename in diff chunk: $chunk");
-            $rfile = self::REPO_FILES . "/$file";
             $chunk = mb_orig_substr($chunk, $first_line_pos + 1);
             $stat = $this->_stat($file);
-            $rstat = $this->_rstat($file);
             $contents = false;
             if ($op === 'A' || $op === 'M') {
                 if ($op === 'A') $diffstat = $chunk;
@@ -808,27 +803,14 @@ class Unrealsync
             if ($op === 'A') {
                 $diffstat = $chunk;
                 if ($stat === $diffstat) continue; // the same file was added
-                if (!$stat || $ignore_conflicts) { // we did not have file, we need to retrieve its contents
-                    $this->_writeFile($file, $diffstat, $contents);
-                    continue;
-                }
-                $conflicts .= "Add/add conflict: $file\n";
-                $conf_list .= $this->_getSizeFromStat($diffstat) . " $file\n";
-                if ($this->is_debug) {
-                    $conflicts .= "local stat: $stat\n\n";
-                    $conflicts .= "remote stat: $diffstat\n\n";
-                }
+                // we did not have file, we need to retrieve its contents
+                $this->_writeFile($file, $diffstat, $contents);
+                continue;
             } else if ($op === 'D') {
                 if ($stat) $this->_removeRecursive($file);
-                if ($rstat) $this->_removeRecursive($rfile);
             } else if ($op === 'M') {
                 list ($oldstat, $diffstat) = explode("\n\n", $chunk);
                 if ($stat === $diffstat) continue; // identical changes
-                if (!$ignore_conflicts && $oldstat !== $stat) {
-                    $conflicts .= "Modify/modify conflict: $file\n";
-                    $conf_list .= $this->_getSizeFromStat($diffstat) . " $file\n";
-                    continue;
-                }
                 $this->_writeFile($file, $diffstat, $contents);
             } else {
                 throw new UnrealsyncException("Unexpected diff chunk: $chunk");
@@ -841,30 +823,6 @@ class Unrealsync
         fwrite(STDERR, "\n");
 
         $this->_timerStop("Apply remote diff done");
-
-        if ($conflicts) {
-            $num = substr_count($conflicts, "\n");
-            fwrite(STDERR, "There were $num conflicts.\n");
-            $tmpfile = false;
-            if ($num > self::MAX_CONFLICTS) {
-                $tmpfile = tempnam(self::REPO_TMP, "unrealsync-conflict");
-                if (!$tmpfile) throw new UnrealsyncException("Cannot create temporary file");
-                file_put_contents($tmpfile, $conflicts);
-                fwrite(STDERR, "Description of all conflicts is written to $tmpfile\n");
-                if ($this->is_unix && $this->askYN("Do you want to review conflicts in-place (using 'less')?")) {
-                    $this->_directSystem('less ' . escapeshellarg($tmpfile));
-                }
-            } else {
-                echo $conflicts . "\n";
-            }
-
-            $q = "Which version should be used ('local' or 'remote')?";
-            $answer = $this->ask($q, 'local', array('local', 'remote'));
-            if ($tmpfile) unlink($tmpfile);
-            if ($answer === 't') $recv_list .= $conf_list;
-        }
-
-        $this->_commitDiff($diff);
         $this->debug("Peak memory: " . memory_get_peak_usage(true));
     }
 
@@ -1060,9 +1018,6 @@ class Unrealsync
         }
         if (!rename($this->chunk_tmp_filename, $this->chunk_filename)) {
             throw new UnrealsyncException("Could not move $this->chunk_filename");
-        }
-        if (!$this->_commit($this->chunk_filename, $stat)) {
-            throw new UnrealsyncException("Could not commit $this->chunk_filename");
         }
 
         return true;
@@ -1390,7 +1345,7 @@ class Unrealsync
 
     private function _cmdApplyDiff($diff)
     {
-        $this->_applyRemoteDiff($this->hostname, $diff, true);
+        $this->_applyRemoteDiff($diff);
     }
 
     /*
@@ -1457,10 +1412,6 @@ class Unrealsync
         foreach ($this->servers as $srv => $srv_data) {
             echo "Propagating merged changes to $srv\n";
             $this->_sync($srv, self::SYNC_FROM_LOCAL);
-            echo "  Committing changes at $srv...";
-            if (!$this->_remoteExecute($srv, self::CMD_COMMIT)) {
-                throw new UnrealsyncException("Cannot commit changes at $srv");
-            }
             echo "done\n";
         }
 
