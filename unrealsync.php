@@ -119,9 +119,18 @@ class Unrealsync
             unset($argv[$k]);
         }
 
+        if (count($argv) === 1) {
+            if (!chdir($argv[0])) {
+                fwrite(STDERR, "Cannot chdir to $argv[0]\n");
+                exit(1);
+            }
+
+            $argv = array();
+        }
+
         if ($argv) {
             fwrite(STDERR, "Unrecognized parameters: " . implode(", ", $argv) . "\n");
-            fwrite(STDERR, "Usage: unrealsync.php [--debug]\n");
+            fwrite(STDERR, "Usage: unrealsync.php [--debug] [<dir>]\n");
             exit(1);
         }
 
