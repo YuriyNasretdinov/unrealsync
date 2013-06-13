@@ -1,14 +1,21 @@
 <?php
 
 /* strlen() can be overloaded in mbstring extension, so always using mb_orig_strlen */
-if (!function_exists('mb_orig_strlen')) { function mb_orig_strlen($str) { return strlen($str); } }
+if (!function_exists('mb_orig_strlen')) {
+    function mb_orig_strlen($str)
+    {
+        return strlen($str);
+    }
+}
 if (!function_exists('mb_orig_substr')) {
-    function mb_orig_substr($str, $offset, $len = null) {
+    function mb_orig_substr($str, $offset, $len = null)
+    {
         return isset($len) ? substr($str, $offset, $len) : substr($str, $offset);
     }
 }
 if (!function_exists('mb_orig_strpos')) {
-    function mb_orig_strpos($haystack, $needle, $offset = 0) {
+    function mb_orig_strpos($haystack, $needle, $offset = 0)
+    {
         return strpos($haystack, $needle, $offset);
     }
 }
@@ -34,9 +41,17 @@ try {
     exit(1);
 }
 
-class UnrealsyncException extends Exception {}
-class UnrealsyncIOException extends UnrealsyncException {}
-class UnrealsyncFileException extends UnrealsyncException {}
+class UnrealsyncException extends Exception
+{
+}
+
+class UnrealsyncIOException extends UnrealsyncException
+{
+}
+
+class UnrealsyncFileException extends UnrealsyncException
+{
+}
 
 class Unrealsync
 {
@@ -50,6 +65,7 @@ class Unrealsync
     const REPO_FILES = '.unrealsync/files';
     const REPO_TMP = '.unrealsync/tmp';
     const REPO_LOCK = '.unrealsync/lock';
+    const REPO_PID = '.unrealsync/pid';
 
     /* Remote commands (length not more than 10 symbols) -> constants map to _cmdValue, e.g. CMD_STAT = 'stat' => _cmdStat */
     const CMD_STAT = 'stat';
@@ -84,7 +100,7 @@ class Unrealsync
     var $servers = array();
 
     var $watcher = array(
-        'pp'   => null, // proc_open handle
+        'pp' => null, // proc_open handle
         'pipe' => null, // stdout pipe
     );
 
@@ -113,9 +129,9 @@ class Unrealsync
     {
         unset($argv[0]);
         foreach ($argv as $k => $v) {
-            if ($v === '--server') $this->is_server = true;
+            if ($v === '--server')     $this->is_server = true;
             else if ($v === '--debug') $this->is_debug = true;
-            else                   continue;
+            else                       continue;
             unset($argv[$k]);
         }
 
@@ -158,6 +174,11 @@ class Unrealsync
                 $this->_remoteExecute($srv, self::CMD_SHUTDOWN);
             }
         }
+    }
+
+    function log($msg)
+    {
+        echo (@date('H:i:s')) . " $msg\n";
     }
 
     /* PHP must write all errors to STDERR as otherwise it will interfere with our communication protocol that uses STDOUT */
@@ -213,6 +234,10 @@ class Unrealsync
 
     private function _lock()
     {
+        if (!file_put_contents(self::REPO_PID, getmypid())) {
+            throw new UnrealsyncException("Cannot write pid to " . self::REPO_PID);
+        }
+
         $this->lockfp = fopen(self::REPO_LOCK, 'a');
         if (!$this->lockfp) throw new UnrealsyncException("Cannot open " . self::REPO_LOCK);
         if (defined('LOCK_NB')) {
@@ -224,7 +249,7 @@ class Unrealsync
                 }
             }
         } else {
-            echo "Trying to obtain lock for " . self::REPO_LOCK . "\n";
+            $this->log("Trying to obtain lock for " . self::REPO_LOCK);
             if (!flock($this->lockfp, LOCK_EX)) throw new UnrealsyncException("Cannot do flock for " . self::REPO_LOCK);
         }
     }
@@ -257,6 +282,18 @@ class Unrealsync
                 $this->exclude[$excl] = true;
             }
         }
+
+        foreach ($config as $section => &$row) {
+            if (!empty($row['disabled'])) {
+                unset($config[$section]);
+                continue;
+            }
+
+            foreach ($core_settings as $k => $v) {
+                if (empty($row[$k])) $row[$k] = $v; //allow default values
+            }
+        }
+        unset($row);
 
         if (!empty($core_settings['onsync'])) $this->onsync = $core_settings['onsync'];
 
@@ -301,13 +338,6 @@ class Unrealsync
                 throw new UnrealsyncException("Internal error: Incorrect validation argument");
             }
         }
-    }
-
-    private function _checkYN($answer)
-    {
-        if (in_array(strtolower($answer), array('yes', 'no', 'y', 'n'))) return true;
-        fwrite(STDERR, "Please write either yes or no\n");
-        return false;
     }
 
     function askYN($q, $default = 'yes')
@@ -609,21 +639,14 @@ class Unrealsync
         if (!$data) throw new UnrealsyncException("Internal error: no data for server $srv");
         if (!$host = $data['host']) throw new UnrealsyncException("No 'host' entry for $srv");
         if (!$dir  = $data['dir']) throw new UnrealsyncException("No 'dir' entry for $srv");
+
         $dir = rtrim($dir, '/');
         $repo_dir = $dir . '/' . self::REPO;
         $dir_esc = escapeshellarg($repo_dir);
-        if (empty($data['os'])) {
-            echo "Retrieving OS because it was not specified in config\n";
-            $data['os'] = $this->ssh($host, "uname", $data);
-            if ($data['os'] === false) throw new UnrealsyncException("Cannot get uname for '$srv");
-        }
-        $data['os'] = ucfirst(strtolower($data['os']));
-        if (!in_array($data['os'], array('Linux', 'Darwin'))) throw new UnrealsyncException("Unsupported remote os '$data[os]' for $srv");
-        echo "  Copying files...";
-        $watcher_path = __DIR__ . '/bin/' . strtolower($data['os']) . '/notify';
+        $this->log("  Copying files...");
         $php_bin = (!empty($data['php']) ? $data['php'] : 'php');
-        $cmd  = "if [ ! -d $dir_esc ]; then mkdir $dir_esc; fi; ";
-        $remote_files = array(__FILE__, $watcher_path);
+        $cmd = "if [ ! -d $dir_esc ]; then mkdir $dir_esc; fi; ";
+        $remote_files = array(__FILE__);
         foreach ($remote_files as $k => $f) {
             $rf = escapeshellarg("$repo_dir/" . basename($f));
             $cmd .= "if [ -f $rf ]; then $php_bin -r 'echo \"$k=\" . md5(file_get_contents(\"'$rf'\")) . \"\\n\";'; fi;";
@@ -644,7 +667,7 @@ class Unrealsync
             if ($result === false) throw new UnrealsyncException("Cannot scp $f to $srv");
         }
 
-        echo "  Starting unrealsync server on $srv...";
+        $this->log("  Starting unrealsync server...");
 
         $result = $this->ssh(
             $host,
@@ -652,8 +675,6 @@ class Unrealsync
             $data + array('proc_open' => true)
         );
         if ($result === false) throw new UnrealsyncException("Cannot start unrealsync daemon on $srv");
-
-        echo "done\n";
 
         $this->remotes[$srv] = $result;
         if ($this->_remoteExecute($srv, self::CMD_PING) != "pong") {
@@ -683,56 +704,8 @@ class Unrealsync
     const SYNC_FROM_LOCAL = "local";
     const SYNC_FROM_REMOTE = "remote";
 
-    /* handle situation when remote repository or remote work copy is empty */
-    private function _handleEmpty($srv, $response)
+    private function _sync($srv, $sync_direction)
     {
-        $empty_repo = (strpos($response, self::EMPTY_REPO) !== false);
-        $empty_local = (strpos($response, self::EMPTY_LOCAL) !== false);
-
-        if ($empty_local && $empty_repo) {
-            echo "  Remote $srv is completely empty. Transferring changes from local machine\n";
-        } else if ($empty_local) {
-            if (!$this->askYN("  Remote $srv has .unrealsync repository, but no files are present. Ignore remote repository?")) {
-                throw new UnrealsyncException("No automatic action can be performed. Please fix this issue manually");
-            }
-        } else if ($empty_repo) {
-            echo "  Remote $srv has some files while .unrealsync repository is empty.\n\n";
-            return $this->_sync($srv);
-        } else {
-            throw new UnrealsyncException("Internal error: unreachable code");
-        }
-
-        return $this->_sync($srv, self::SYNC_FROM_LOCAL);
-    }
-
-    private function _askSyncDirection($srv)
-    {
-        $sync_direction = false;
-
-        echo "  Only one-way offline synchronization is supported\n";
-        echo "  You can choose either local or remote copies to be propagated.\n";
-        echo "  If you choose '" . self::SYNC_FROM_LOCAL . "', all changes on $srv will be LOST and vice versa\n\n";
-        $is_ok = false;
-        while (!$is_ok) {
-            $sync_direction = $this->ask(
-                "  Please choose primary repository (" . self::SYNC_FROM_LOCAL . " or " . self::SYNC_FROM_REMOTE . "):",
-                self::SYNC_FROM_LOCAL,
-                array(self::SYNC_FROM_LOCAL, self::SYNC_FROM_REMOTE)
-            );
-
-            if ($sync_direction === self::SYNC_FROM_LOCAL) $q = "  All changes (if any) at $srv will be lost. Continue? ";
-            else $q = "  All local changes will be lost. Continue? ";
-
-            if ($this->askYN($q)) $is_ok = true;
-        }
-
-        return $sync_direction;
-    }
-
-    private function _sync($srv, $sync_direction = null)
-    {
-        if (!$sync_direction) $sync_direction = $this->_askSyncDirection($srv);
-
         $rsync_cmd = "rsync -a --delete ";
         foreach ($this->exclude as $excl => $_) {
             if ($excl == '.' || $excl == '..') continue;
@@ -741,19 +714,19 @@ class Unrealsync
         $remote_arg = escapeshellarg($this->servers[$srv]['host'] . ":" . rtrim($this->servers[$srv]['dir'], "/") . "/");
         switch ($sync_direction) {
             case self::SYNC_FROM_LOCAL:
-                echo "  Rsync to $srv...";
+                $this->log("  Rsync to remote server...");
                 $cmd = "$rsync_cmd ./ $remote_arg";
                 $this->_exec($cmd, $out, $retval);
                 if ($retval) throw new UnrealsyncException("Cannot do '$cmd'");
-                echo "done\n";
                 break;
+
             case self::SYNC_FROM_REMOTE:
-                echo "  Rsync from $srv...";
+                $this->log("  Rsync from remote server...");
                 $cmd = "$rsync_cmd $remote_arg ./";
                 $this->_exec($cmd, $out, $retval);
                 if ($retval) throw new UnrealsyncException("Cannot do '$cmd'");
-                echo "done\n";
                 break;
+
             default:
                 throw new UnrealsyncException("Unknown sync direction: $sync_direction");
         }
@@ -942,7 +915,6 @@ class Unrealsync
                 $response .= sprintf("%10u", mb_orig_strlen($contents));
                 $response .= $contents;
             }
-
         }
 
         return $response;
@@ -1203,8 +1175,10 @@ class Unrealsync
         switch ($result['mode'] & 0170000) {
             case 0040000:
                 return "dir";
+
             case 0120000:
                 return "symlink=" . readlink($filename);
+
             case 0100000: // regular file
                 $mode = $result['mode'] & 0777;
                 if (!$this->is_unix) {
@@ -1336,7 +1310,7 @@ class Unrealsync
         if ($this->is_server) throw new UnrealsyncException("Send and commit diff is not implemented on server");
         if (!$len = mb_orig_strlen($this->diff)) return;
         $this->had_changes = true;
-        echo "diff size " . ($len > 1024 ? round($len / 1024) . " KiB" : $len . " bytes") . "\n";
+        $this->log("diff size " . ($len > 1024 ? round($len / 1024) . " KiB" : $len . " bytes"));
 
         $this->_remoteExecuteAll(self::CMD_APPLY_DIFF, $this->diff);
         $this->_commitDiff();
@@ -1346,7 +1320,8 @@ class Unrealsync
     private function _sendDirsDiff($dirs)
     {
         $this->had_changes = false;
-        echo "\nChanged dirs: " . implode(" ", $dirs) . "\n";
+        echo "\n";
+        $this->log("Changed dirs: " . implode(" ", $dirs));
         foreach ($dirs as $dir) $this->_appendDiff($dir, false);
 
         if (mb_orig_strlen($this->diff) > 0) $this->_sendAndCommitDiff();
@@ -1414,28 +1389,23 @@ class Unrealsync
         if ($this->is_server) return $this->runServer();
 
         foreach ($this->servers as $srv => $srv_data) {
-            echo "Doing initial synchronization for $srv\n";
+            $this->log("Preparing $srv");
             $this->_bootstrap($srv);
-        }
-
-        foreach ($this->servers as $srv => $srv_data) {
-            echo "Propagating merged changes to $srv\n";
             $this->_sync($srv, self::SYNC_FROM_LOCAL);
-            echo "done\n";
         }
 
-        echo "Commiting local changes...";
+        $this->log("Commiting local changes...");
         if (!$this->_commitDir()) throw new UnrealsyncException("Cannot commit changes locally");
-        echo "done\n";
 
-        echo "Starting local watcher...";
+        $this->log("Starting local watcher...");
         $this->_startLocalWatcher();
-        echo "done\n";
+
+        $this->log("Started successfully");
+
         $dir_hashes = array();
 
         $write = $except = array();
         while (false !== ($ln = fgets($this->watcher['pipe']))) {
-//            echo "Read $ln";
             $ln = rtrim($ln);
             if ($ln === "-") {
                 $read = array($this->watcher['pipe']);
