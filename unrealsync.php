@@ -340,6 +340,13 @@ class Unrealsync
         }
     }
 
+    private function _checkYN($answer)
+    {
+        if (in_array(strtolower($answer), array('yes', 'no', 'y', 'n'))) return true;
+        fwrite(STDERR, "Please write either yes or no\n");
+        return false;
+    }
+
     function askYN($q, $default = 'yes')
     {
         $answer = $this->ask($q, $default, array($this, '_checkYN'));
