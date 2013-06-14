@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,11 +25,6 @@ type Settings struct {
 
 	dir string
 	os  string
-}
-
-type Diff struct {
-	dir  string
-	info os.FileInfo
 }
 
 type UnrealStat struct {
@@ -53,15 +49,23 @@ const (
 	REPO_LOCK          = REPO_DIR + "lock"
 
 	REPO_SEP = "/\n"
+	DIFF_SEP = "\n------------\n"
 
 	DB_FILE = "Unreal.db"
+
+	MAX_DIFF_SIZE = 2 * 1024 * 1204
 )
 
 var (
 	source_dir     string
 	unrealsync_dir string
+	repo_mutex     sync.Mutex
+	local_diff     [MAX_DIFF_SIZE]byte
+	local_diff_ptr int
 	fschanges      = make(chan string, 1000)
 	dirschan       = make(chan string, 1000)
+	sendchan       = make(chan string, 1000)
+	remotediffchan = make(chan []byte, 100)
 	excludes       = map[string]bool{}
 	servers        = map[string]Settings{}
 )
@@ -144,7 +148,7 @@ func usage() {
 }
 
 func runWizard() {
-	log.Fatal("Not implemented yet")
+	log.Fatal("Run Wizard Not implemented yet")
 }
 
 func parseExcludes(excl string) map[string]bool {
@@ -204,6 +208,8 @@ func parseConfig() {
 		excludes = parseExcludes(general["exclude"])
 	}
 
+	excludes[".unrealsync"] = true
+
 	delete(dict, GENERAL_SECTION)
 
 	for key, server_settings := range dict {
@@ -262,7 +268,7 @@ func syncThread() {
 			all_dirs[<-dirschan] = true
 		}
 
-		if len(all_dirs) > 0 && sync(all_dirs) {
+		if len(all_dirs) > 0 && do_sync(all_dirs) {
 			continue
 		}
 
@@ -363,6 +369,99 @@ func shouldIgnore(path string) bool {
 	return false
 }
 
+func sendBigFile(file string, stat *UnrealStat) (unreal_err int) {
+	progressLn("Send big file: ", file, "; Stat: ", stat.Serialize())
+	return
+}
+
+func sendDiff() (unreal_err int) {
+	if local_diff_ptr == 0 {
+		return
+	}
+
+	progressLn("Diff:", string(local_diff[0:local_diff_ptr]))
+	local_diff_ptr = 0
+	return
+}
+
+func addToDiff(file string, stat *UnrealStat) (unreal_err int) {
+	diff_header_str := ""
+	var diff_len int64
+	var buf []byte
+
+	if stat == nil {
+		diff_header_str += "D " + file + DIFF_SEP
+	} else {
+		diff_header_str += "A " + file + "\n" + stat.Serialize() + DIFF_SEP
+		if stat.is_dir == false {
+			diff_len = stat.size
+		}
+	}
+
+	diff_header := []byte(diff_header_str)
+
+	if diff_len > MAX_DIFF_SIZE/2 {
+		unreal_err = sendBigFile(file, stat)
+		return
+	}
+
+	if local_diff_ptr+int(diff_len)+len(diff_header) >= MAX_DIFF_SIZE-1 {
+		if unreal_err = sendDiff(); unreal_err > 0 {
+			return
+		}
+	}
+
+	if stat != nil && diff_len > 0 {
+		if stat.is_link {
+			buf_str, err := os.Readlink(file)
+			if err != nil {
+				progressLn("Could not read link " + file)
+				unreal_err = ERROR_RECOVERABLE
+				return
+			}
+
+			buf = []byte(buf_str)
+
+			if len(buf) != int(diff_len) {
+				progressLn("Readlink different number of bytes than expected from ", file)
+				unreal_err = ERROR_RECOVERABLE
+				return
+			}
+		} else {
+			fp, err := os.Open(file)
+			if err != nil {
+				progressLn("Could not open ", file, ": ", err)
+				unreal_err = ERROR_RECOVERABLE
+				return
+			}
+			defer fp.Close()
+
+			buf = make([]byte, diff_len)
+			n, err := fp.Read(buf)
+			if err != nil && err != io.EOF {
+				// if we were unable to read file that we just opened then probably there are some problems with the OS
+				progressLn("Cannot read ", file, ": ", err)
+				unreal_err = ERROR_FATAL
+				return
+			}
+
+			if n != int(diff_len) {
+				progressLn("Read different number of bytes than expected from ", file)
+				unreal_err = ERROR_RECOVERABLE
+				return
+			}
+		}
+	}
+
+	local_diff_ptr += copy(local_diff[local_diff_ptr:], diff_header)
+
+	if stat != nil && diff_len > 0 {
+		local_diff_ptr += copy(local_diff[local_diff_ptr:], buf)
+	}
+
+	return
+}
+
 func syncDir(dir string, recursive bool) (unreal_err int) {
 
 	if shouldIgnore(dir) {
@@ -414,13 +513,12 @@ func syncDir(dir string, recursive bool) (unreal_err int) {
 			if !ok || !StatsEqual(info, repo_el) {
 
 				if info.IsDir() && (recursive || !ok || !repo_el.is_dir) {
-					unreal_err = syncDir(dir+"/"+info.Name(), true)
-					if unreal_err > 0 {
+					if unreal_err = syncDir(dir+"/"+info.Name(), true); unreal_err > 0 {
 						return
 					}
 				}
 
-				repo_info[info.Name()] = UnrealStat{
+				unreal_stat := UnrealStat{
 					info.IsDir(),
 					(info.Mode()&os.ModeSymlink == os.ModeSymlink),
 					int16(uint32(info.Mode()) & 0777),
@@ -428,12 +526,17 @@ func syncDir(dir string, recursive bool) (unreal_err int) {
 					info.Size(),
 				}
 
+				repo_info[info.Name()] = unreal_stat
+
 				prefix := "Changed: "
 				if !ok {
 					prefix = "Added: "
 				}
 				progressLn(prefix, dir, "/", info.Name())
-				progressLn("Should send file using network")
+
+				if unreal_err = addToDiff(dir+"/"+info.Name(), &unreal_stat); unreal_err > 0 {
+					return
+				}
 
 				changes_count++
 			}
@@ -447,7 +550,10 @@ func syncDir(dir string, recursive bool) (unreal_err int) {
 			delete(repo_info, name)
 
 			progressLn("Deleted: ", dir, "/", name)
-			progressLn("Should delete file using network")
+
+			if unreal_err = addToDiff(dir+"/"+name, nil); unreal_err > 0 {
+				return
+			}
 
 			changes_count++
 		} else if err != nil {
@@ -458,14 +564,16 @@ func syncDir(dir string, recursive bool) (unreal_err int) {
 	}
 
 	if changes_count > 0 {
-		// network commit
+		if unreal_err = sendDiff(); unreal_err > 0 {
+			return
+		}
 		writeRepoInfo(dir, repo_info)
 	}
 
 	return
 }
 
-func sync(dirs map[string]bool) (should_retry bool) {
+func do_sync(dirs map[string]bool) (should_retry bool) {
 	i := 0
 	dirs_list := make([]string, len(dirs))
 	for dir := range dirs {
