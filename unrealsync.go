@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -68,6 +69,7 @@ var (
 	remotediffchan = make(chan []byte, 100)
 	excludes       = map[string]bool{}
 	servers        = map[string]Settings{}
+	is_server      = *flag.Bool("server", false, "Internal parameter used on remote side")
 )
 
 func (p UnrealStat) Serialize() (res string) {
@@ -226,21 +228,94 @@ func parseConfig() {
 	}
 }
 
+func sshOptions(settings Settings) []string {
+	options := []string{}
+	if (settings.port > 0) {
+		options = append(options, "-o", fmt.Sprintf("Port=%d", settings.port))
+	}
+	if (settings.username != "") {
+		options = append(options, "-o", "User=" + settings.username)
+	}
+
+	return options
+}
+
+func execOrExit(cmd string, args []string) string {
+	output, err := exec.Command(cmd, args...).CombinedOutput()
+	if err != nil {
+		fmt.Print("Cannot ", cmd, " ", args, ", got error: ", err.Error(), "\n")
+		fmt.Print("Command output:\n", string(output), "\n")
+		os.Exit(1)
+	}
+
+	return string(output)
+}
+
+func startServer(settings Settings) {
+	args := sshOptions(settings)
+	// TODO: escaping
+	dir := settings.dir + "/.unrealsync"
+	args = append(args, settings.host, "if [ ! -d " + dir + " ]; then mkdir " + dir + "; fi; uname")
+
+	output := execOrExit("ssh", args)
+	uname := strings.TrimSpace(output)
+
+	if uname != "Darwin" {
+		fmt.Print("Unknown os at " + settings.host + ":'" + uname + "'\n")
+		os.Exit(1)
+	}
+
+	args = sshOptions(settings)
+	source := unrealsync_dir + "/unrealsync-" + strings.ToLower(uname)
+	destination := settings.host + ":" + dir + "/unrealsync"
+	args = append(args, source, destination)
+	execOrExit("scp", args)
+
+	// TODO: escaping
+	args = []string{"-e", "ssh " + strings.Join(sshOptions(settings), " ")}
+	for mask := range excludes {
+		args = append(args, "--exclude=" + mask)
+	}
+
+	// TODO: escaping of remote dir
+	args = append(args, source_dir + "/", settings.host + ":" + settings.dir + "/")
+	execOrExit("rsync", args)
+
+	progressLn(settings.host, ":", settings.dir, " ready")
+}
+
+func applyThread(stream io.ReadCloser) {
+
+}
+
 func initialize() {
 	var err error
 
-	source_dir, err = os.Getwd()
-	if err != nil {
-		log.Fatal("Cannot get current directory")
+	flag.Parse()
+	args := flag.Args()
+
+	if len(args) == 0 {
+		source_dir, err = os.Getwd()
+		if err != nil {
+			log.Fatal("Cannot get current directory")
+		}
+	} else if len(args) == 1 {
+		source_dir = args[0]
+		if err := os.Chdir(source_dir); err != nil {
+			log.Fatal("Cannot chdir to " + source_dir)
+		}
+	} else {
+		fmt.Fprintln(os.Stderr, "Usage: unrealsync [<flags>] [<dir>]")
+		flag.PrintDefaults()
+		os.Exit(2)
 	}
+	
 	progressLn("Unrealsync starting from " + source_dir)
 
 	unrealsync_dir, err = filepath.Abs(path.Dir(os.Args[0]))
 	if err != nil {
 		log.Fatal("Cannot determine unrealsync binary location: " + err.Error())
 	}
-
-	flag.Parse()
 
 	for _, dir := range []string{REPO_DIR, REPO_FILES, REPO_TMP} {
 		_, err = os.Stat(dir)
@@ -252,12 +327,20 @@ func initialize() {
 		}
 	}
 
-	_, err = os.Stat(REPO_CLIENT_CONFIG)
-	if err != nil {
-		runWizard()
+	if !is_server {
+		_, err = os.Stat(REPO_CLIENT_CONFIG)
+		if err != nil {
+			runWizard()
+		}
+
+		parseConfig()
+		for _, settings := range servers {
+			go startServer(settings)
+		}
+	} else {
+		go applyThread(os.Stdin)
 	}
 
-	parseConfig()
 	go runFsChangesThread(".")
 }
 
