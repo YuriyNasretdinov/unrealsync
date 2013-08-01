@@ -52,6 +52,13 @@ const (
 	REPO_SEP = "/\n"
 	DIFF_SEP = "\n------------\n"
 
+	ACTION_LEN    = 10
+	ACTION_PING   = "PING      "
+
+	RESPONSE_PONG = "PONG      "
+
+	LEN_BYTES = 10 // how many bytes we use to encode packet length
+
 	DB_FILE = "Unreal.db"
 
 	MAX_DIFF_SIZE = 2 * 1024 * 1204
@@ -69,7 +76,10 @@ var (
 	remotediffchan = make(chan []byte, 100)
 	excludes       = map[string]bool{}
 	servers        = map[string]Settings{}
-	is_server      = *flag.Bool("server", false, "Internal parameter used on remote side")
+	is_server_ptr  = flag.Bool("server", false, "Internal parameter used on remote side")
+	is_server      = false
+	hostname_ptr   = flag.String("hostname", "unknown", "Internal parameter used on remote side")
+	hostname       = ""
 )
 
 func (p UnrealStat) Serialize() (res string) {
@@ -134,7 +144,7 @@ func UnrealStatUnserialize(input string) (result UnrealStat) {
 }
 
 func progress(a ...interface{}) {
-	fmt.Fprint(os.Stderr, time.Now().Format("15:04:05"), " ")
+	fmt.Fprint(os.Stderr, time.Now().Format("15:04:05"), " ", hostname, "$ ", strings.Repeat(" ", 10 - len(hostname)))
 	fmt.Fprint(os.Stderr, a...)
 }
 
@@ -261,8 +271,7 @@ func startServer(settings Settings) {
 	uname := strings.TrimSpace(output)
 
 	if uname != "Darwin" {
-		fmt.Print("Unknown os at " + settings.host + ":'" + uname + "'\n")
-		os.Exit(1)
+		log.Fatal("Unknown os at " + settings.host + ":'" + uname + "'")
 	}
 
 	args = sshOptions(settings)
@@ -281,36 +290,88 @@ func startServer(settings Settings) {
 	args = append(args, source_dir + "/", settings.host + ":" + settings.dir + "/")
 	execOrExit("rsync", args)
 
+	args = sshOptions(settings)
+	// TODO: escaping
+	args = append(args, settings.host, dir + "/unrealsync --server --hostname=" + settings.host + " " + settings.dir)
+
+	cmd := exec.Command("ssh", args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Fatal("Cannot get stdout pipe: ", err.Error())
+	}
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		log.Fatal("Cannot get stdin pipe: ", err.Error())
+	}
+
+	cmd.Stderr = os.Stderr
+
+	if err = cmd.Start(); err != nil {
+		log.Fatal("Cannot start command ssh", args, ": ", err.Error())
+	}
+
+	go applyThread(stdout, stdin, settings.host)
+
+	if _, err = stdin.Write([]byte(ACTION_PING)); err != nil {
+		log.Fatal("Cannot ping ", settings.host)
+	}
 	progressLn(settings.host, ":", settings.dir, " ready")
 }
 
-func applyThread(stream io.ReadCloser) {
+func applyThread(in_stream io.ReadCloser, out_stream io.WriteCloser, hostname string) {
+	action := make([]byte, ACTION_LEN)
 
+	for {
+		_, err := io.ReadFull(in_stream, action)
+		if err != nil {
+			log.Fatal("Cannot read action in applyThread: ", err.Error())
+		}
+
+		action_str := string(action)
+		if action_str == ACTION_PING {
+			_, err = out_stream.Write([]byte(RESPONSE_PONG))
+		} else if action_str == RESPONSE_PONG {
+			progressLn("Received PONG from ", hostname)
+		} else {
+			log.Fatal("Unknown action in applyThread: ", action_str)
+		}
+	}
 }
 
 func initialize() {
 	var err error
 
 	flag.Parse()
+	is_server = *is_server_ptr
+
+	if is_server {
+		hostname = *hostname_ptr
+	}
+
 	args := flag.Args()
 
-	if len(args) == 0 {
-		source_dir, err = os.Getwd()
-		if err != nil {
-			log.Fatal("Cannot get current directory")
+	if len(args) == 1 {
+		if err := os.Chdir(args[0]); err != nil {
+			log.Fatal("Cannot chdir to ", args[0])
 		}
-	} else if len(args) == 1 {
-		source_dir = args[0]
-		if err := os.Chdir(source_dir); err != nil {
-			log.Fatal("Cannot chdir to " + source_dir)
-		}
-	} else {
+	} else if len(args) > 1 {
 		fmt.Fprintln(os.Stderr, "Usage: unrealsync [<flags>] [<dir>]")
 		flag.PrintDefaults()
 		os.Exit(2)
 	}
+
+	source_dir, err = os.Getwd()
+	if err != nil {
+		log.Fatal("Cannot get current directory")
+	}
+
+	if is_server {
+		progressLn("Unrealsync server starting from ", source_dir)
+	} else {
+		progressLn("Unrealsync starting from ", source_dir)
+	}
 	
-	progressLn("Unrealsync starting from " + source_dir)
 
 	unrealsync_dir, err = filepath.Abs(path.Dir(os.Args[0]))
 	if err != nil {
@@ -338,7 +399,8 @@ func initialize() {
 			go startServer(settings)
 		}
 	} else {
-		go applyThread(os.Stdin)
+		excludes[".unrealsync"] = true
+		go applyThread(os.Stdin, os.Stdout, "server")
 	}
 
 	go runFsChangesThread(".")
