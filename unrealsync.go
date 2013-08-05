@@ -291,7 +291,7 @@ func startServer(settings Settings) {
 	output := execOrExit("ssh", args)
 	uname := strings.TrimSpace(output)
 
-	if uname != "Darwin" {
+	if uname != "Darwin" && uname != "Linux" {
 		fatalLn("Unknown os at " + settings.host + ":'" + uname + "'")
 	}
 
@@ -354,7 +354,7 @@ func applyThread(in_stream io.ReadCloser, hostname string) {
 	for {
 		_, err := io.ReadFull(in_stream, action)
 		if err != nil {
-			fatalLn("Cannot read action in applyThread: ", err.Error())
+			fatalLn("Cannot read action in applyThread from ", hostname, ": ", err.Error())
 		}
 
 		action_str := string(action)
@@ -364,12 +364,12 @@ func applyThread(in_stream io.ReadCloser, hostname string) {
 			progressLn(hostname, " reported that it is alive")
 		} else if action_str == ACTION_DIFF {
 			if _, err := io.ReadFull(in_stream, length_bytes); err != nil {
-				fatalLn("Cannot read diff length in applyThread: ", err.Error())
+				fatalLn("Cannot read diff length in applyThread from ", hostname, ": ", err.Error())
 			}
 
 			length, err := strconv.Atoi(strings.TrimSpace(string(length_bytes)))
 			if err != nil {
-				fatalLn("Incorrect diff length in applyThread: ", err.Error())
+				fatalLn("Incorrect diff length in applyThread from ", hostname, ": ", err.Error())
 			}
 
 			if length == 0 {
@@ -377,17 +377,17 @@ func applyThread(in_stream io.ReadCloser, hostname string) {
 			}
 
 			if length > MAX_DIFF_SIZE {
-				fatalLn("Too big diff, probably communication error")
+				fatalLn("Too big diff from ", hostname, ", probably communication error")
 			}
 
 			buf := make([]byte, length)
 			if _, err := io.ReadFull(in_stream, buf); err != nil {
-				fatalLn("Cannot read diff")
+				fatalLn("Cannot read diff from ", hostname)
 			}
 
 			applyRemoteDiff(buf)
 		} else {
-			fatalLn("Unknown action in applyThread: ", action_str)
+			fatalLn("Unknown action in applyThread from ", hostname, ": ", action_str)
 		}
 	}
 }
@@ -578,7 +578,7 @@ func sendChangesThread() {
 				fatalLn("Internal inconstency: send stream is not a WriteCloser")
 			}
 
-			if msg.action == ACTION_PONG {
+			if msg.action == ACTION_PONG || msg.action == ACTION_PING {
 				if _, err := stream.Write([]byte(msg.action)); err != nil {
 					fatalLn("Cannot write ", msg.action, ": ", err.Error())
 				}
@@ -673,7 +673,15 @@ func initialize() {
 		go applyThread(os.Stdin, "server")
 	}
 
-	go runFsChangesThread(".")
+	go runFsChangesThread(source_dir)
+	go pingThread()
+}
+
+func pingThread() {
+	for {
+		sendchan <- OutMsg{ACTION_PING, nil}
+		time.Sleep(time.Minute)
+	}
 }
 
 func syncThread() {
@@ -1062,6 +1070,19 @@ func main() {
 				progressLn("Cannot compute relative path: ", err)
 				continue
 			}
+		}
+
+		stat, err := os.Lstat(path)
+
+		if err != nil {
+			if !os.IsNotExist(err) {
+				progressLn("Stat failed for ", path, ": ", err.Error())
+				continue
+			}
+
+			path = filepath.Dir(path)
+		} else if !stat.IsDir() {
+			path = filepath.Dir(path)
 		}
 
 		dirschan <- path
