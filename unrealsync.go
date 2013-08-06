@@ -38,8 +38,9 @@ type UnrealStat struct {
 }
 
 type OutMsg struct {
-	action string
-	data   interface{}
+	action        string
+	data          interface{}
+	source_stream interface{}
 }
 
 const (
@@ -63,7 +64,8 @@ const (
 	ACTION_PONG = "PONG      "
 	ACTION_DIFF = "DIFF      "
 
-	ACTION_ADDSTREAM = "ADDSTREAM " // special action to add new send stream (after host is ready)
+	ACTION_DIFF_RESEND = "DIFFRESEND" // special action to re-send diff to all other connected streams
+	ACTION_ADDSTREAM   = "ADDSTREAM " // special action to add new send stream (after host is ready)
 
 	DB_FILE = "Unreal.db"
 
@@ -153,14 +155,21 @@ func UnrealStatUnserialize(input string) (result UnrealStat) {
 	return
 }
 
+func _progress(a []interface{}, with_eol bool) {
+	msg := fmt.Sprint(time.Now().Format("15:04:05"), " ", hostname, "$ ", strings.Repeat(" ", 10-len(hostname)))
+	msg += fmt.Sprint(a...)
+	if with_eol {
+		msg += fmt.Sprint("\n")
+	}
+	fmt.Fprint(os.Stderr, msg)
+}
+
 func progress(a ...interface{}) {
-	fmt.Fprint(os.Stderr, time.Now().Format("15:04:05"), " ", hostname, "$ ", strings.Repeat(" ", 10-len(hostname)))
-	fmt.Fprint(os.Stderr, a...)
+	_progress(a, false)
 }
 
 func progressLn(a ...interface{}) {
-	progress(a...)
-	fmt.Fprint(os.Stderr, "\n")
+	_progress(a, true)
 }
 
 func fatalLn(a ...interface{}) {
@@ -260,7 +269,7 @@ func parseConfig() {
 }
 
 func sshOptions(settings Settings) []string {
-	options := []string{}
+	options := []string{"-o", "Compression=yes"}
 	if settings.port > 0 {
 		options = append(options, "-o", fmt.Sprintf("Port=%d", settings.port))
 	}
@@ -283,10 +292,12 @@ func execOrExit(cmd string, args []string) string {
 }
 
 func startServer(settings Settings) {
+	progressLn("Creating directories at " + settings.host + "...")
+
 	args := sshOptions(settings)
 	// TODO: escaping
 	dir := settings.dir + "/.unrealsync"
-	args = append(args, settings.host, "if [ ! -d "+dir+" ]; then mkdir "+dir+"; fi; uname")
+	args = append(args, settings.host, "if [ ! -d "+dir+" ]; then mkdir -p "+dir+"; fi; uname")
 
 	output := execOrExit("ssh", args)
 	uname := strings.TrimSpace(output)
@@ -295,11 +306,15 @@ func startServer(settings Settings) {
 		fatalLn("Unknown os at " + settings.host + ":'" + uname + "'")
 	}
 
+	progressLn("Copying unrealsync binary to " + settings.host + "...")
+
 	args = sshOptions(settings)
 	source := unrealsync_dir + "/unrealsync-" + strings.ToLower(uname)
 	destination := settings.host + ":" + dir + "/unrealsync"
 	args = append(args, source, destination)
 	execOrExit("scp", args)
+
+	progressLn("Initial file sync using rsync at " + settings.host + "...")
 
 	// TODO: escaping
 	args = []string{"-e", "ssh " + strings.Join(sshOptions(settings), " ")}
@@ -310,6 +325,8 @@ func startServer(settings Settings) {
 	// TODO: escaping of remote dir
 	args = append(args, "-a", "--delete", source_dir+"/", settings.host+":"+settings.dir+"/")
 	execOrExit("rsync", args)
+
+	progressLn("Launching unrealsync at " + settings.host + "...")
 
 	args = sshOptions(settings)
 	// TODO: escaping
@@ -339,15 +356,15 @@ func startServer(settings Settings) {
 		fatalLn("Cannot start command ssh", args, ": ", err.Error())
 	}
 
-	sendchan <- OutMsg{ACTION_ADDSTREAM, stdin}
-	go applyThread(stdout, settings.host)
+	sendchan <- OutMsg{ACTION_ADDSTREAM, nil, stdin}
+	go applyThread(stdout, stdin, settings.host)
 
 	if _, err = stdin.Write([]byte(ACTION_PING)); err != nil {
 		fatalLn("Cannot ping ", settings.host)
 	}
 }
 
-func applyThread(in_stream io.ReadCloser, hostname string) {
+func applyThread(in_stream io.ReadCloser, out_stream io.WriteCloser, hostname string) {
 	action := make([]byte, 10)
 	length_bytes := make([]byte, 10)
 
@@ -359,7 +376,7 @@ func applyThread(in_stream io.ReadCloser, hostname string) {
 
 		action_str := string(action)
 		if action_str == ACTION_PING {
-			sendchan <- OutMsg{ACTION_PONG, nil}
+			sendchan <- OutMsg{ACTION_PONG, nil, out_stream}
 		} else if action_str == ACTION_PONG {
 			progressLn(hostname, " reported that it is alive")
 		} else if action_str == ACTION_DIFF {
@@ -386,6 +403,8 @@ func applyThread(in_stream io.ReadCloser, hostname string) {
 			}
 
 			applyRemoteDiff(buf)
+
+			sendchan <- OutMsg{ACTION_DIFF_RESEND, buf, out_stream}
 		} else {
 			fatalLn("Unknown action in applyThread from ", hostname, ": ", action_str)
 		}
@@ -568,7 +587,7 @@ func sendChangesThread() {
 		msg := <-sendchan
 
 		if msg.action == ACTION_ADDSTREAM {
-			sendstreamlist.PushBack(msg.data)
+			sendstreamlist.PushBack(msg.source_stream)
 			continue
 		}
 
@@ -582,14 +601,24 @@ func sendChangesThread() {
 				if _, err := stream.Write([]byte(msg.action)); err != nil {
 					fatalLn("Cannot write ", msg.action, ": ", err.Error())
 				}
-			} else if msg.action == ACTION_DIFF {
+			} else if msg.action == ACTION_DIFF || msg.action == ACTION_DIFF_RESEND {
+				if msg.action == ACTION_DIFF_RESEND {
+					source_stream, ok := msg.source_stream.(io.WriteCloser)
+					if !ok {
+						fatalLn("Source stream is not WriteCloser")
+					}
+					if stream == source_stream {
+						continue
+					}
+				}
+
 				buf, ok := msg.data.([]byte)
 				if !ok {
 					fatalLn("Internal inconstency: msg data is not []byte")
 				}
 
-				if _, err := stream.Write([]byte(msg.action)); err != nil {
-					fatalLn("Cannot write ", msg.action, ": ", err.Error())
+				if _, err := stream.Write([]byte(ACTION_DIFF)); err != nil {
+					fatalLn("Cannot write ", ACTION_DIFF, ": ", err.Error())
 				}
 
 				if _, err := stream.Write([]byte(fmt.Sprintf("%10d", len(buf)))); err != nil {
@@ -669,8 +698,8 @@ func initialize() {
 		}
 	} else {
 		excludes[".unrealsync"] = true
-		sendchan <- OutMsg{ACTION_ADDSTREAM, os.Stdout}
-		go applyThread(os.Stdin, "server")
+		sendchan <- OutMsg{ACTION_ADDSTREAM, nil, os.Stdout}
+		go applyThread(os.Stdin, os.Stdout, "server")
 	}
 
 	go runFsChangesThread(source_dir)
@@ -679,7 +708,7 @@ func initialize() {
 
 func pingThread() {
 	for {
-		sendchan <- OutMsg{ACTION_PING, nil}
+		sendchan <- OutMsg{ACTION_PING, nil, nil}
 		time.Sleep(time.Minute)
 	}
 }
@@ -806,7 +835,7 @@ func sendDiff() (unreal_err int) {
 
 	buf := make([]byte, local_diff_ptr)
 	copy(buf, local_diff[0:local_diff_ptr])
-	sendchan <- OutMsg{ACTION_DIFF, buf}
+	sendchan <- OutMsg{ACTION_DIFF, buf, nil}
 	local_diff_ptr = 0
 	return
 }
