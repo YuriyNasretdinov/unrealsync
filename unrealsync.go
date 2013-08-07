@@ -43,6 +43,11 @@ type OutMsg struct {
 	source_stream interface{}
 }
 
+type ChangeReceiver struct {
+	changeschan chan OutMsg
+	stream      io.WriteCloser
+}
+
 const (
 	ERROR_RECOVERABLE = 1
 	ERROR_FATAL       = 2
@@ -66,10 +71,16 @@ const (
 
 	ACTION_DIFF_RESEND = "DIFFRESEND" // special action to re-send diff to all other connected streams
 	ACTION_ADDSTREAM   = "ADDSTREAM " // special action to add new send stream (after host is ready)
+	ACTION_DELSTREAM   = "DELSTREAM " // special action to delete send stream (after losing connection to host)
+	ACTION_STOP        = "STOP      " // special action to stop send stream thread
 
 	DB_FILE = "Unreal.db"
 
-	MAX_DIFF_SIZE = 2 * 1024 * 1204
+	MAX_DIFF_SIZE           = 2 * 1024 * 1204
+	DEFAULT_CONNECT_TIMEOUT = 10
+	RETRY_INTERVAL          = 10
+	SERVER_ALIVE_INTERVAL   = 3
+	SERVER_ALIVE_COUNT_MAX  = 4
 )
 
 var (
@@ -269,7 +280,10 @@ func parseConfig() {
 }
 
 func sshOptions(settings Settings) []string {
-	options := []string{"-o", "Compression=yes"}
+	options := []string{"-o", "Compression=yes", "-o", fmt.Sprint("ConnectTimeout=", DEFAULT_CONNECT_TIMEOUT)}
+	options = append(options, "-o", fmt.Sprint("ServerAliveInterval=", SERVER_ALIVE_INTERVAL))
+	options = append(options, "-o", fmt.Sprint("ServerAliveCountMax=", SERVER_ALIVE_COUNT_MAX))
+
 	if settings.port > 0 {
 		options = append(options, "-o", fmt.Sprintf("Port=%d", settings.port))
 	}
@@ -283,21 +297,33 @@ func sshOptions(settings Settings) []string {
 func execOrExit(cmd string, args []string) string {
 	output, err := exec.Command(cmd, args...).CombinedOutput()
 	if err != nil {
-		fmt.Print("Cannot ", cmd, " ", args, ", got error: ", err.Error(), "\n")
-		fmt.Print("Command output:\n", string(output), "\n")
-		os.Exit(1)
+		progressLn("Cannot ", cmd, " ", args, ", got error: ", err.Error())
+		progressLn("Command output:\n", string(output))
+		panic("Command exited with non-zero code")
 	}
 
 	return string(output)
 }
 
 func startServer(settings Settings) {
+	defer func() {
+		if err := recover(); err != nil {
+			progressLn("Failed to start for server ", settings.host, ": ", err)
+
+			go func() {
+				time.Sleep(RETRY_INTERVAL * time.Second)
+				progressLn("Reconnecting to " + settings.host)
+				startServer(settings)
+			}()
+		}
+	}()
+
 	progressLn("Creating directories at " + settings.host + "...")
 
 	args := sshOptions(settings)
 	// TODO: escaping
 	dir := settings.dir + "/.unrealsync"
-	args = append(args, settings.host, "if [ ! -d "+dir+" ]; then mkdir -p "+dir+"; fi; uname")
+	args = append(args, settings.host, "if [ ! -d "+dir+" ]; then mkdir -p "+dir+"; fi; rm -f "+dir+"/unrealsync && uname")
 
 	output := execOrExit("ssh", args)
 	uname := strings.TrimSpace(output)
@@ -353,40 +379,59 @@ func startServer(settings Settings) {
 	cmd.Stderr = os.Stderr
 
 	if err = cmd.Start(); err != nil {
-		fatalLn("Cannot start command ssh", args, ": ", err.Error())
+		panic("Cannot start command ssh " + strings.Join(args, " ") + ": " + err.Error())
 	}
 
 	sendchan <- OutMsg{ACTION_ADDSTREAM, nil, stdin}
-	go applyThread(stdout, stdin, settings.host)
+	go applyThread(stdout, stdin, settings)
 
 	if _, err = stdin.Write([]byte(ACTION_PING)); err != nil {
-		fatalLn("Cannot ping ", settings.host)
+		panic("Cannot ping " + settings.host)
 	}
 }
 
-func applyThread(in_stream io.ReadCloser, out_stream io.WriteCloser, hostname string) {
+func applyThread(in_stream io.ReadCloser, out_stream io.WriteCloser, settings Settings) {
+	hostname := settings.host
+
+	defer func() {
+		if err := recover(); err != nil {
+			if is_server {
+				fatalLn("Lost connection to remote side (you should not see this message)")
+			}
+
+			progressLn("Lost connection to " + hostname)
+			sendchan <- OutMsg{ACTION_DELSTREAM, true, out_stream}
+
+			go func() {
+				time.Sleep(RETRY_INTERVAL * time.Second)
+				progressLn("Reconnecting to " + hostname)
+				startServer(settings)
+			}()
+		}
+	}()
+
 	action := make([]byte, 10)
 	length_bytes := make([]byte, 10)
 
 	for {
 		_, err := io.ReadFull(in_stream, action)
 		if err != nil {
-			fatalLn("Cannot read action in applyThread from ", hostname, ": ", err.Error())
+			panic("Cannot read action in applyThread from " + hostname + ": " + err.Error())
 		}
 
 		action_str := string(action)
 		if action_str == ACTION_PING {
 			sendchan <- OutMsg{ACTION_PONG, nil, out_stream}
 		} else if action_str == ACTION_PONG {
-			progressLn(hostname, " reported that it is alive")
+			debugLn(hostname, " reported that it is alive")
 		} else if action_str == ACTION_DIFF {
 			if _, err := io.ReadFull(in_stream, length_bytes); err != nil {
-				fatalLn("Cannot read diff length in applyThread from ", hostname, ": ", err.Error())
+				panic("Cannot read diff length in applyThread from " + hostname + ": " + err.Error())
 			}
 
 			length, err := strconv.Atoi(strings.TrimSpace(string(length_bytes)))
 			if err != nil {
-				fatalLn("Incorrect diff length in applyThread from ", hostname, ": ", err.Error())
+				panic("Incorrect diff length in applyThread from " + hostname + ": " + err.Error())
 			}
 
 			if length == 0 {
@@ -394,19 +439,19 @@ func applyThread(in_stream io.ReadCloser, out_stream io.WriteCloser, hostname st
 			}
 
 			if length > MAX_DIFF_SIZE {
-				fatalLn("Too big diff from ", hostname, ", probably communication error")
+				panic("Too big diff from " + hostname + ", probably communication error")
 			}
 
 			buf := make([]byte, length)
 			if _, err := io.ReadFull(in_stream, buf); err != nil {
-				fatalLn("Cannot read diff from ", hostname)
+				panic("Cannot read diff from " + hostname)
 			}
 
 			applyRemoteDiff(buf)
 
 			sendchan <- OutMsg{ACTION_DIFF_RESEND, buf, out_stream}
 		} else {
-			fatalLn("Unknown action in applyThread from ", hostname, ": ", action_str)
+			panic("Unknown action in applyThread from " + hostname + ": " + action_str)
 		}
 	}
 }
@@ -582,55 +627,77 @@ func applyRemoteDiff(buf []byte) {
 	}
 }
 
+func sendChangesToStream(stream io.WriteCloser, changeschan chan OutMsg) {
+	defer func() {
+		if err := recover(); err != nil {
+			sendchan <- OutMsg{ACTION_STOP, false, stream}
+		}
+		stream.Close()
+	}()
+
+	for {
+		msg := <-changeschan
+
+		if msg.action == ACTION_STOP {
+			return
+		} else if msg.action == ACTION_PONG || msg.action == ACTION_PING {
+			if _, err := stream.Write([]byte(msg.action)); err != nil {
+				panic("Cannot write " + msg.action + ": " + err.Error())
+			}
+		} else if msg.action == ACTION_DIFF || msg.action == ACTION_DIFF_RESEND {
+			if msg.action == ACTION_DIFF_RESEND {
+				if stream == msg.source_stream.(io.WriteCloser) {
+					continue
+				}
+			}
+
+			buf := msg.data.([]byte)
+			if _, err := stream.Write([]byte(ACTION_DIFF)); err != nil {
+				panic("Cannot write " + ACTION_DIFF + ": " + err.Error())
+			}
+
+			if _, err := stream.Write([]byte(fmt.Sprintf("%10d", len(buf)))); err != nil {
+				panic("Cannot write length for " + msg.action + ": " + err.Error())
+			}
+
+			if _, err := stream.Write(buf); err != nil {
+				panic("Cannot write data for " + msg.action + ": " + err.Error())
+			}
+		} else {
+			panic("Internal inconstency: unknown action " + msg.action)
+		}
+	}
+}
+
 func sendChangesThread() {
 	for {
 		msg := <-sendchan
 
 		if msg.action == ACTION_ADDSTREAM {
-			sendstreamlist.PushBack(msg.source_stream)
+			changeschan := make(chan OutMsg)
+			source_stream := msg.source_stream.(io.WriteCloser)
+			sendstreamlist.PushBack(ChangeReceiver{changeschan, source_stream})
+			go sendChangesToStream(source_stream, changeschan)
+			continue
+		} else if msg.action == ACTION_DELSTREAM {
+			send_stop := msg.data.(bool)
+			source_stream := msg.source_stream.(io.WriteCloser)
+
+			for e := sendstreamlist.Front(); e != nil; e = e.Next() {
+				receiver := e.Value.(ChangeReceiver)
+				if receiver.stream == source_stream {
+					if send_stop {
+						receiver.changeschan <- OutMsg{ACTION_STOP, nil, receiver.stream}
+					}
+					sendstreamlist.Remove(e)
+				}
+			}
 			continue
 		}
 
 		for e := sendstreamlist.Front(); e != nil; e = e.Next() {
-			stream, ok := e.Value.(io.WriteCloser)
-			if !ok {
-				fatalLn("Internal inconstency: send stream is not a WriteCloser")
-			}
-
-			if msg.action == ACTION_PONG || msg.action == ACTION_PING {
-				if _, err := stream.Write([]byte(msg.action)); err != nil {
-					fatalLn("Cannot write ", msg.action, ": ", err.Error())
-				}
-			} else if msg.action == ACTION_DIFF || msg.action == ACTION_DIFF_RESEND {
-				if msg.action == ACTION_DIFF_RESEND {
-					source_stream, ok := msg.source_stream.(io.WriteCloser)
-					if !ok {
-						fatalLn("Source stream is not WriteCloser")
-					}
-					if stream == source_stream {
-						continue
-					}
-				}
-
-				buf, ok := msg.data.([]byte)
-				if !ok {
-					fatalLn("Internal inconstency: msg data is not []byte")
-				}
-
-				if _, err := stream.Write([]byte(ACTION_DIFF)); err != nil {
-					fatalLn("Cannot write ", ACTION_DIFF, ": ", err.Error())
-				}
-
-				if _, err := stream.Write([]byte(fmt.Sprintf("%10d", len(buf)))); err != nil {
-					fatalLn("Cannot length for ", msg.action, ": ", err.Error())
-				}
-
-				if _, err := stream.Write(buf); err != nil {
-					fatalLn("Cannot write data for ", msg.action, ": ", err.Error())
-				}
-			} else {
-				fatalLn("Internal inconstency: unknown action ", msg.action)
-			}
+			receiver := e.Value.(ChangeReceiver)
+			receiver.changeschan <- msg
 		}
 	}
 }
@@ -699,7 +766,7 @@ func initialize() {
 	} else {
 		excludes[".unrealsync"] = true
 		sendchan <- OutMsg{ACTION_ADDSTREAM, nil, os.Stdout}
-		go applyThread(os.Stdin, os.Stdout, "server")
+		go applyThread(os.Stdin, os.Stdout, Settings{nil, "local", hostname, 0, source_dir, "local-os"})
 	}
 
 	go runFsChangesThread(source_dir)
