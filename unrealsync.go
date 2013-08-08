@@ -49,8 +49,7 @@ type ChangeReceiver struct {
 }
 
 const (
-	ERROR_RECOVERABLE = 1
-	ERROR_FATAL       = 2
+	ERROR_FATAL = 1
 
 	GENERAL_SECTION = "general_settings"
 
@@ -65,14 +64,17 @@ const (
 	DIFF_SEP = "\n------------\n"
 
 	// all actions must be 10 symbols length
-	ACTION_PING = "PING      "
-	ACTION_PONG = "PONG      "
-	ACTION_DIFF = "DIFF      "
+	ACTION_PING       = "PING      "
+	ACTION_PONG       = "PONG      "
+	ACTION_DIFF       = "DIFF      "
+	ACTION_BIG_INIT   = "BIGINIT   "
+	ACTION_BIG_RCV    = "BIGRCV    "
+	ACTION_BIG_COMMIT = "BIGCOMMIT "
+	ACTION_BIG_ABORT  = "BIGABORT  "
 
-	ACTION_DIFF_RESEND = "DIFFRESEND" // special action to re-send diff to all other connected streams
-	ACTION_ADDSTREAM   = "ADDSTREAM " // special action to add new send stream (after host is ready)
-	ACTION_DELSTREAM   = "DELSTREAM " // special action to delete send stream (after losing connection to host)
-	ACTION_STOP        = "STOP      " // special action to stop send stream thread
+	ACTION_ADD_STREAM = "ADDSTREAM " // special action to add new send stream (after host is ready)
+	ACTION_DEL_STREAM = "DELSTREAM " // special action to delete send stream (after losing connection to host)
+	ACTION_STOP       = "STOP      " // special action to stop send stream thread
 
 	DB_FILE = "Unreal.db"
 
@@ -164,6 +166,16 @@ func UnrealStatUnserialize(input string) (result UnrealStat) {
 	}
 
 	return
+}
+
+func UnrealStatFromStat(info os.FileInfo) UnrealStat {
+	return UnrealStat{
+		info.IsDir(),
+		(info.Mode()&os.ModeSymlink == os.ModeSymlink),
+		int16(uint32(info.Mode()) & 0777),
+		info.ModTime().Unix(),
+		info.Size(),
+	}
 }
 
 func _progress(a []interface{}, with_eol bool) {
@@ -270,6 +282,11 @@ func parseConfig() {
 			continue
 		}
 
+		if _, ok := server_settings["disabled"]; ok {
+			progressLn("Skipping [" + key + "] as disabled")
+			continue
+		}
+
 		for general_key, general_value := range general {
 			if server_settings[general_key] == "" {
 				server_settings[general_key] = general_value
@@ -294,7 +311,7 @@ func sshOptions(settings Settings) []string {
 	return options
 }
 
-func execOrExit(cmd string, args []string) string {
+func execOrPanic(cmd string, args []string) string {
 	output, err := exec.Command(cmd, args...).CombinedOutput()
 	if err != nil {
 		progressLn("Cannot ", cmd, " ", args, ", got error: ", err.Error())
@@ -325,7 +342,7 @@ func startServer(settings Settings) {
 	dir := settings.dir + "/.unrealsync"
 	args = append(args, settings.host, "if [ ! -d "+dir+" ]; then mkdir -p "+dir+"; fi; rm -f "+dir+"/unrealsync && uname")
 
-	output := execOrExit("ssh", args)
+	output := execOrPanic("ssh", args)
 	uname := strings.TrimSpace(output)
 
 	if uname != "Darwin" && uname != "Linux" {
@@ -338,7 +355,7 @@ func startServer(settings Settings) {
 	source := unrealsync_dir + "/unrealsync-" + strings.ToLower(uname)
 	destination := settings.host + ":" + dir + "/unrealsync"
 	args = append(args, source, destination)
-	execOrExit("scp", args)
+	execOrPanic("scp", args)
 
 	progressLn("Initial file sync using rsync at " + settings.host + "...")
 
@@ -350,7 +367,7 @@ func startServer(settings Settings) {
 
 	// TODO: escaping of remote dir
 	args = append(args, "-a", "--delete", source_dir+"/", settings.host+":"+settings.dir+"/")
-	execOrExit("rsync", args)
+	execOrPanic("rsync", args)
 
 	progressLn("Launching unrealsync at " + settings.host + "...")
 
@@ -382,7 +399,7 @@ func startServer(settings Settings) {
 		panic("Cannot start command ssh " + strings.Join(args, " ") + ": " + err.Error())
 	}
 
-	sendchan <- OutMsg{ACTION_ADDSTREAM, nil, stdin}
+	sendchan <- OutMsg{ACTION_ADD_STREAM, nil, stdin}
 	go applyThread(stdout, stdin, settings)
 
 	if _, err = stdin.Write([]byte(ACTION_PING)); err != nil {
@@ -390,17 +407,58 @@ func startServer(settings Settings) {
 	}
 }
 
+func readResponse(in_stream io.ReadCloser) []byte {
+	length_bytes := make([]byte, 10)
+
+	if _, err := io.ReadFull(in_stream, length_bytes); err != nil {
+		panic("Cannot read diff length in applyThread from " + hostname + ": " + err.Error())
+	}
+
+	length, err := strconv.Atoi(strings.TrimSpace(string(length_bytes)))
+	if err != nil {
+		panic("Incorrect diff length in applyThread from " + hostname + ": " + err.Error())
+	}
+
+	buf := make([]byte, length)
+	if length == 0 {
+		return buf
+	}
+
+	if length > MAX_DIFF_SIZE {
+		panic("Too big diff from " + hostname + ", probably communication error")
+	}
+
+	if _, err := io.ReadFull(in_stream, buf); err != nil {
+		panic("Cannot read diff from " + hostname)
+	}
+
+	return buf
+}
+
 func applyThread(in_stream io.ReadCloser, out_stream io.WriteCloser, settings Settings) {
 	hostname := settings.host
 
+	var (
+		big_name     string
+		big_tmp_name string
+		big_fp       *os.File
+	)
+
 	defer func() {
+		if big_fp != nil {
+			big_fp.Close()
+			os.Remove(big_tmp_name)
+		}
+
 		if err := recover(); err != nil {
 			if is_server {
+				progressLn("Server error at ", hostname, ": ", err)
 				fatalLn("Lost connection to remote side (you should not see this message)")
 			}
 
-			progressLn("Lost connection to " + hostname)
-			sendchan <- OutMsg{ACTION_DELSTREAM, true, out_stream}
+			progressLn("Error from ", hostname, ": ", err)
+			progressLn("Lost connection to ", hostname)
+			sendchan <- OutMsg{ACTION_DEL_STREAM, true, out_stream}
 
 			go func() {
 				time.Sleep(RETRY_INTERVAL * time.Second)
@@ -411,7 +469,6 @@ func applyThread(in_stream io.ReadCloser, out_stream io.WriteCloser, settings Se
 	}()
 
 	action := make([]byte, 10)
-	length_bytes := make([]byte, 10)
 
 	for {
 		_, err := io.ReadFull(in_stream, action)
@@ -424,34 +481,50 @@ func applyThread(in_stream io.ReadCloser, out_stream io.WriteCloser, settings Se
 			sendchan <- OutMsg{ACTION_PONG, nil, out_stream}
 		} else if action_str == ACTION_PONG {
 			debugLn(hostname, " reported that it is alive")
-		} else if action_str == ACTION_DIFF {
-			if _, err := io.ReadFull(in_stream, length_bytes); err != nil {
-				panic("Cannot read diff length in applyThread from " + hostname + ": " + err.Error())
-			}
-
-			length, err := strconv.Atoi(strings.TrimSpace(string(length_bytes)))
-			if err != nil {
-				panic("Incorrect diff length in applyThread from " + hostname + ": " + err.Error())
-			}
-
-			if length == 0 {
-				continue
-			}
-
-			if length > MAX_DIFF_SIZE {
-				panic("Too big diff from " + hostname + ", probably communication error")
-			}
-
-			buf := make([]byte, length)
-			if _, err := io.ReadFull(in_stream, buf); err != nil {
-				panic("Cannot read diff from " + hostname)
-			}
-
-			applyRemoteDiff(buf)
-
-			sendchan <- OutMsg{ACTION_DIFF_RESEND, buf, out_stream}
 		} else {
-			panic("Unknown action in applyThread from " + hostname + ": " + action_str)
+			buf := readResponse(in_stream)
+
+			if action_str == ACTION_DIFF {
+				applyRemoteDiff(buf)
+			} else if action_str == ACTION_BIG_INIT {
+				big_name = string(buf)
+				big_tmp_name = REPO_TMP + filepath.Base(big_name)
+				big_fp, err = os.OpenFile(big_tmp_name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0777)
+				if err != nil {
+					panic("Cannot open tmp file " + big_tmp_name + ": " + err.Error())
+				}
+			} else if action_str == ACTION_BIG_RCV {
+				if _, err := big_fp.Write(buf); err != nil {
+					panic("Cannot write to tmp file " + big_tmp_name + ": " + err.Error())
+				}
+			} else if action_str == ACTION_BIG_COMMIT {
+				bigstat := UnrealStatUnserialize(string(buf))
+				if err = big_fp.Close(); err != nil {
+					panic("Cannot close tmp file " + big_tmp_name + ": " + err.Error())
+				}
+
+				if err = os.Chmod(big_tmp_name, os.FileMode(bigstat.mode)); err != nil {
+					panic("Cannot chmod " + big_tmp_name + ": " + err.Error())
+				}
+
+				if err = os.Chtimes(big_tmp_name, time.Unix(bigstat.mtime, 0), time.Unix(bigstat.mtime, 0)); err != nil {
+					panic("Cannot set mtime for " + big_tmp_name + ": " + err.Error())
+				}
+
+				repo_mutex.Lock()
+
+				info_map := getRepoInfo(filepath.Dir(big_name))
+				os.Rename(big_tmp_name, big_name)
+				info_map[filepath.Base(big_name)] = bigstat
+				writeRepoInfo(filepath.Dir(big_name), info_map)
+
+				repo_mutex.Unlock()
+			} else if action_str == ACTION_BIG_ABORT {
+				big_fp.Close()
+				os.Remove(big_tmp_name)
+			}
+
+			sendchan <- OutMsg{action_str, buf, out_stream}
 		}
 	}
 }
@@ -627,7 +700,7 @@ func applyRemoteDiff(buf []byte) {
 	}
 }
 
-func sendChangesToStream(stream io.WriteCloser, changeschan chan OutMsg) {
+func sendChangesToStreamThread(stream io.WriteCloser, changeschan chan OutMsg) {
 	defer func() {
 		if err := recover(); err != nil {
 			sendchan <- OutMsg{ACTION_STOP, false, stream}
@@ -637,6 +710,10 @@ func sendChangesToStream(stream io.WriteCloser, changeschan chan OutMsg) {
 
 	for {
 		msg := <-changeschan
+		source_stream, ok := msg.source_stream.(io.WriteCloser)
+		if ok && source_stream == stream {
+			continue
+		}
 
 		if msg.action == ACTION_STOP {
 			return
@@ -644,16 +721,10 @@ func sendChangesToStream(stream io.WriteCloser, changeschan chan OutMsg) {
 			if _, err := stream.Write([]byte(msg.action)); err != nil {
 				panic("Cannot write " + msg.action + ": " + err.Error())
 			}
-		} else if msg.action == ACTION_DIFF || msg.action == ACTION_DIFF_RESEND {
-			if msg.action == ACTION_DIFF_RESEND {
-				if stream == msg.source_stream.(io.WriteCloser) {
-					continue
-				}
-			}
-
+		} else {
 			buf := msg.data.([]byte)
-			if _, err := stream.Write([]byte(ACTION_DIFF)); err != nil {
-				panic("Cannot write " + ACTION_DIFF + ": " + err.Error())
+			if _, err := stream.Write([]byte(msg.action)); err != nil {
+				panic("Cannot write " + msg.action + ": " + err.Error())
 			}
 
 			if _, err := stream.Write([]byte(fmt.Sprintf("%10d", len(buf)))); err != nil {
@@ -663,8 +734,6 @@ func sendChangesToStream(stream io.WriteCloser, changeschan chan OutMsg) {
 			if _, err := stream.Write(buf); err != nil {
 				panic("Cannot write data for " + msg.action + ": " + err.Error())
 			}
-		} else {
-			panic("Internal inconstency: unknown action " + msg.action)
 		}
 	}
 }
@@ -673,13 +742,13 @@ func sendChangesThread() {
 	for {
 		msg := <-sendchan
 
-		if msg.action == ACTION_ADDSTREAM {
+		if msg.action == ACTION_ADD_STREAM {
 			changeschan := make(chan OutMsg)
 			source_stream := msg.source_stream.(io.WriteCloser)
 			sendstreamlist.PushBack(ChangeReceiver{changeschan, source_stream})
-			go sendChangesToStream(source_stream, changeschan)
+			go sendChangesToStreamThread(source_stream, changeschan)
 			continue
-		} else if msg.action == ACTION_DELSTREAM {
+		} else if msg.action == ACTION_DEL_STREAM {
 			send_stop := msg.data.(bool)
 			source_stream := msg.source_stream.(io.WriteCloser)
 
@@ -696,8 +765,7 @@ func sendChangesThread() {
 		}
 
 		for e := sendstreamlist.Front(); e != nil; e = e.Next() {
-			receiver := e.Value.(ChangeReceiver)
-			receiver.changeschan <- msg
+			e.Value.(ChangeReceiver).changeschan <- msg
 		}
 	}
 }
@@ -765,7 +833,7 @@ func initialize() {
 		}
 	} else {
 		excludes[".unrealsync"] = true
-		sendchan <- OutMsg{ACTION_ADDSTREAM, nil, os.Stdout}
+		sendchan <- OutMsg{ACTION_ADD_STREAM, nil, os.Stdout}
 		go applyThread(os.Stdin, os.Stdout, Settings{nil, "local", hostname, 0, source_dir, "local-os"})
 	}
 
@@ -891,7 +959,62 @@ func shouldIgnore(path string) bool {
 }
 
 func sendBigFile(file string, stat *UnrealStat) (unreal_err int) {
-	progressLn("NOT IMPLEMENTED: Send big file: ", file, "; Stat: ", stat.Serialize())
+	progressLn("Sending big file: ", file, " (", (stat.size / 1024 / 1024), " MiB)")
+
+	fp, err := os.Open(file)
+	if err != nil {
+		progressLn("Could not open ", file, ": ", err)
+		return
+	}
+	defer fp.Close()
+
+	sendchan <- OutMsg{ACTION_BIG_INIT, []byte(file), nil}
+
+	bytes_left := stat.size
+
+	for {
+		buf := make([]byte, MAX_DIFF_SIZE/2)
+
+		file_stat, err := fp.Stat()
+		if err != nil {
+			progressLn("Cannot stat ", file, " that we are reading right now: ", err.Error())
+			sendchan <- OutMsg{ACTION_BIG_ABORT, []byte(file), nil}
+			unreal_err = ERROR_FATAL
+			return
+		}
+
+		if !StatsEqual(file_stat, *stat) {
+			progressLn("File ", file, " has changed, aborting transfer")
+			sendchan <- OutMsg{ACTION_BIG_ABORT, []byte(file), nil}
+			return
+		}
+
+		n, err := fp.Read(buf)
+		if err != nil && err != io.EOF {
+			// if we were unable to read file that we just opened then probably there are some problems with the OS
+			progressLn("Cannot read ", file, ": ", err)
+			sendchan <- OutMsg{ACTION_BIG_ABORT, []byte(file), nil}
+			unreal_err = ERROR_FATAL
+			return
+		}
+
+		if n != len(buf) && int64(n) != bytes_left {
+			progressLn("Read different number of bytes than expected from ", file)
+			sendchan <- OutMsg{ACTION_BIG_ABORT, []byte(file), nil}
+			return
+		}
+
+		sendchan <- OutMsg{ACTION_BIG_RCV, buf[0:n], nil}
+
+		if bytes_left -= int64(n); bytes_left == 0 {
+			break
+		}
+	}
+
+	sendchan <- OutMsg{ACTION_BIG_COMMIT, []byte(stat.Serialize()), nil}
+
+	progressLn("Big file ", file, " successfully sent")
+
 	return
 }
 
@@ -939,7 +1062,6 @@ func addToDiff(file string, stat *UnrealStat) (unreal_err int) {
 			buf_str, err := os.Readlink(file)
 			if err != nil {
 				progressLn("Could not read link " + file)
-				unreal_err = ERROR_RECOVERABLE
 				return
 			}
 
@@ -947,14 +1069,12 @@ func addToDiff(file string, stat *UnrealStat) (unreal_err int) {
 
 			if len(buf) != int(diff_len) {
 				progressLn("Readlink different number of bytes than expected from ", file)
-				unreal_err = ERROR_RECOVERABLE
 				return
 			}
 		} else {
 			fp, err := os.Open(file)
 			if err != nil {
 				progressLn("Could not open ", file, ": ", err)
-				unreal_err = ERROR_RECOVERABLE
 				return
 			}
 			defer fp.Close()
@@ -970,7 +1090,6 @@ func addToDiff(file string, stat *UnrealStat) (unreal_err int) {
 
 			if n != int(diff_len) {
 				progressLn("Read different number of bytes than expected from ", file)
-				unreal_err = ERROR_RECOVERABLE
 				return
 			}
 		}
@@ -994,7 +1113,6 @@ func syncDir(dir string, recursive, send_changes bool) (unreal_err int) {
 	fp, err := os.Open(dir)
 	if err != nil {
 		progressLn("Cannot open ", dir, ": ", err.Error())
-		unreal_err = ERROR_RECOVERABLE
 		return
 	}
 
@@ -1003,13 +1121,11 @@ func syncDir(dir string, recursive, send_changes bool) (unreal_err int) {
 	stat, err := fp.Stat()
 	if err != nil {
 		progressLn("Cannot stat ", dir, ": ", err.Error())
-		unreal_err = ERROR_RECOVERABLE
 		return
 	}
 
 	if !stat.IsDir() {
 		progressLn("Suddenly ", dir, " stopped being a directory")
-		unreal_err = ERROR_RECOVERABLE
 		return
 	}
 
@@ -1046,8 +1162,7 @@ func syncDir(dir string, recursive, send_changes bool) (unreal_err int) {
 			}
 
 			progressLn("Could not read directory names from " + dir + ": " + err.Error())
-			unreal_err = ERROR_RECOVERABLE // it is debatable whether or not this is ok to try to recover from that
-			return
+			break
 		}
 
 		for _, info := range res {
@@ -1063,13 +1178,7 @@ func syncDir(dir string, recursive, send_changes bool) (unreal_err int) {
 					}
 				}
 
-				unreal_stat := UnrealStat{
-					info.IsDir(),
-					(info.Mode()&os.ModeSymlink == os.ModeSymlink),
-					int16(uint32(info.Mode()) & 0777),
-					info.ModTime().Unix(),
-					info.Size(),
-				}
+				unreal_stat := UnrealStatFromStat(info)
 
 				repo_info[info.Name()] = unreal_stat
 
@@ -1125,11 +1234,7 @@ func do_sync(dirs map[string]bool) (should_retry bool) {
 			continue
 		}
 		unreal_err := syncDir(dir, false, true)
-		if unreal_err == ERROR_RECOVERABLE {
-			progressLn("Got recoverable error, trying again in a bit")
-			should_retry = true
-			return
-		} else if unreal_err == ERROR_FATAL {
+		if unreal_err == ERROR_FATAL {
 			fatalLn("Unrecoverable error, exiting (this should never happen! please file a bug report)")
 		}
 	}
