@@ -571,7 +571,13 @@ func writeFile(file string, unreal_stat UnrealStat, contents []byte) {
 
 	if _, err = fp.Write(contents); err != nil {
 		// TODO: more accurate error handling
-		progressLn("Cannot write contents to ", tempnam)
+		progressLn("Cannot write contents to ", tempnam, ": ", err.Error())
+		fp.Close()
+		return
+	}
+
+	if err = fp.Chmod(os.FileMode(unreal_stat.mode)); err != nil {
+		progressLn("Cannot chmod ", tempnam, ": ", err.Error())
 		fp.Close()
 		return
 	}
@@ -585,14 +591,14 @@ func writeFile(file string, unreal_stat UnrealStat, contents []byte) {
 		return
 	}
 
+	if err = os.Chtimes(tempnam, time.Unix(unreal_stat.mtime, 0), time.Unix(unreal_stat.mtime, 0)); err != nil {
+		progressLn("Failed to change modification time for ", file, ": ", err.Error())
+	}
+
 	if err = os.Rename(tempnam, file); err != nil {
 		progressLn("Cannot rename ", tempnam, " to ", file)
 		os.Remove(tempnam)
 		return
-	}
-
-	if err = os.Chtimes(file, time.Unix(unreal_stat.mtime, 0), time.Unix(unreal_stat.mtime, 0)); err != nil {
-		progressLn("Failed to change modification time for ", file, ": ", err.Error())
 	}
 
 	debugLn("Wrote ", file, " ", unreal_stat.Serialize())
