@@ -179,7 +179,11 @@ func UnrealStatFromStat(info os.FileInfo) UnrealStat {
 }
 
 func _progress(a []interface{}, with_eol bool) {
-	msg := fmt.Sprint(time.Now().Format("15:04:05"), " ", hostname, "$ ", strings.Repeat(" ", 10-len(hostname)))
+	repeat_len := 10 - len(hostname)
+	if repeat_len <= 0 {
+		repeat_len = 1
+	}
+	msg := fmt.Sprint(time.Now().Format("15:04:05"), " ", hostname, "$ ", strings.Repeat(" ", repeat_len))
 	msg += fmt.Sprint(a...)
 	if with_eol {
 		msg += fmt.Sprint("\n")
