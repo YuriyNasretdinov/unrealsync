@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <string.h>
 
 /* gcc should be able to optimize strlen() for constant strings */
 #define PRINT(str) write(1, str, strlen(str))
@@ -231,7 +232,7 @@ static int do_watch(int max_watches)
                 goto loop_end;
             }
 
-            if (ev->mask & IN_ISDIR) {
+            if (ev->mask & IN_ISDIR && ev->len > 0 && strcmp(ev->name, ".")) {
                 if (ev->len + strlen(path) > sizeof(path) - 1) {
                     ERROR("Too deep directory: ");
                     ERROR(path);

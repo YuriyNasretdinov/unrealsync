@@ -66,6 +66,7 @@ class Unrealsync
     const REPO_TMP = '.unrealsync/tmp';
     const REPO_LOCK = '.unrealsync/lock';
     const REPO_PID = '.unrealsync/pid';
+    const REPO_NOTIFY_PID = '.unrealsync/notify_pid';
 
     /* Remote commands (length not more than 10 symbols) -> constants map to _cmdValue, e.g. CMD_STAT = 'stat' => _cmdStat */
     const CMD_STAT = 'stat';
@@ -134,6 +135,8 @@ class Unrealsync
             else                       continue;
             unset($argv[$k]);
         }
+
+        $argv = array_values($argv);
 
         if (count($argv) === 1) {
             if (!chdir($argv[0])) {
@@ -212,6 +215,10 @@ class Unrealsync
     private function _setupUnrealsyncDir()
     {
         if ($this->is_server) chdir(dirname(__FILE__));
+
+        if (file_exists(self::REPO_PID)) unlink(self::REPO_PID);
+        if (file_exists(self::REPO_NOTIFY_PID)) unlink(self::REPO_NOTIFY_PID);
+
         if (is_dir(self::REPO)) return true;
         $old_cwd = getcwd();
         while (realpath('..') != realpath(getcwd())) {
@@ -234,10 +241,6 @@ class Unrealsync
 
     private function _lock()
     {
-        if (!file_put_contents(self::REPO_PID, getmypid())) {
-            throw new UnrealsyncException("Cannot write pid to " . self::REPO_PID);
-        }
-
         $this->lockfp = fopen(self::REPO_LOCK, 'a');
         if (!$this->lockfp) throw new UnrealsyncException("Cannot open " . self::REPO_LOCK);
         if (defined('LOCK_NB')) {
@@ -251,6 +254,10 @@ class Unrealsync
         } else {
             $this->log("Trying to obtain lock for " . self::REPO_LOCK);
             if (!flock($this->lockfp, LOCK_EX)) throw new UnrealsyncException("Cannot do flock for " . self::REPO_LOCK);
+        }
+
+        if (!file_put_contents(self::REPO_PID, getmypid())) {
+            throw new UnrealsyncException("Cannot write pid to " . self::REPO_PID);
         }
     }
 
@@ -548,6 +555,12 @@ class Unrealsync
             'pp' => $pp,
             'pipe' => $pipes[1],
         );
+
+        $status = proc_get_status($pp);
+        if (!$status) throw new UnrealsyncException("Cannot get notify proc status");
+        if (!file_put_contents(self::REPO_NOTIFY_PID, $status['pid'])) {
+            throw new UnrealsyncException("Cannot write " . self::REPO_NOTIFY_PID);
+        }
     }
 
     function debug($msg)
