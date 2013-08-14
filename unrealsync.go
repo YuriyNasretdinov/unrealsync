@@ -250,10 +250,15 @@ func parseServerSettings(section string, server_settings map[string]string) Sett
 		local_excludes = parseExcludes(server_settings["exclude"])
 	}
 
+	host, ok := server_settings["host"]
+	if !ok {
+		host = section
+	}
+
 	return Settings{
 		local_excludes,
 		server_settings["username"],
-		server_settings["host"],
+		host,
 		port,
 		server_settings["dir"],
 		server_settings["os"],
