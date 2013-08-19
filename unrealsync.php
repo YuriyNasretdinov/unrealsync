@@ -299,6 +299,8 @@ class Unrealsync
             foreach ($core_settings as $k => $v) {
                 if (empty($row[$k])) $row[$k] = $v; //allow default values
             }
+
+            if (!isset($row['host'])) $row['host'] = $section;
         }
         unset($row);
 
