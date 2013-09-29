@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"container/list"
+	"crypto/md5"
 	"flag"
 	"fmt"
 	ini "github.com/glacjay/goini"
@@ -35,6 +36,11 @@ type UnrealStat struct {
 	mode    int16
 	mtime   int64
 	size    int64
+}
+
+type BigFile struct {
+	fp       *os.File
+	tmp_name string
 }
 
 type OutMsg struct {
@@ -83,6 +89,8 @@ const (
 	RETRY_INTERVAL          = 10
 	SERVER_ALIVE_INTERVAL   = 3
 	SERVER_ALIVE_COUNT_MAX  = 4
+
+	PING_INTERVAL = 5e9
 )
 
 var (
@@ -94,6 +102,7 @@ var (
 	fschanges      = make(chan string, 1000)
 	dirschan       = make(chan string, 1000)
 	sendchan       = make(chan OutMsg)
+	rcvchan        = make(chan bool)
 	remotediffchan = make(chan []byte, 100)
 	excludes       = map[string]bool{}
 	servers        = map[string]Settings{}
@@ -414,6 +423,8 @@ func startServer(settings Settings) {
 	if _, err = stdin.Write([]byte(ACTION_PING)); err != nil {
 		panic("Cannot ping " + settings.host)
 	}
+
+	cmd.Wait()
 }
 
 func readResponse(in_stream io.ReadCloser) []byte {
@@ -444,19 +455,105 @@ func readResponse(in_stream io.ReadCloser) []byte {
 	return buf
 }
 
+func tmpBigName(filename string) string {
+	h := md5.New()
+	return REPO_TMP + "big_" + fmt.Sprintf("%x", h.Sum([]byte(filename)))
+}
+
+func processBigInit(buf []byte, big_fps map[string]BigFile) {
+	filename := string(buf)
+	tmp_name := tmpBigName(filename)
+	fp, err := os.OpenFile(tmp_name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0777)
+	if err != nil {
+		panic("Cannot open tmp file " + tmp_name + ": " + err.Error())
+	}
+
+	big_fps[filename] = BigFile{fp, tmp_name}
+}
+
+func processBigRcv(buf []byte, big_fps map[string]BigFile) {
+	buf_offset := 0
+
+	filename_len, err := strconv.ParseInt(string(buf[buf_offset:10]), 10, 32)
+	if err != nil {
+		panic("Cannot parse big filename length")
+	}
+
+	buf_offset += 10
+	filename := string(buf[buf_offset : buf_offset+int(filename_len)])
+	buf_offset += int(filename_len)
+
+	big_file, ok := big_fps[filename]
+	if !ok {
+		panic("Received big chunk for unknown file: " + filename)
+	}
+
+	if _, err = big_file.fp.Write(buf[buf_offset:]); err != nil {
+		panic("Cannot write to tmp file " + big_file.tmp_name + ": " + err.Error())
+	}
+}
+
+func processBigCommit(buf []byte, big_fps map[string]BigFile) {
+	buf_offset := 0
+
+	filename_len, err := strconv.ParseInt(string(buf[buf_offset:10]), 10, 32)
+	if err != nil {
+		panic("Cannot parse big filename length")
+	}
+
+	buf_offset += 10
+	filename := string(buf[buf_offset : buf_offset+int(filename_len)])
+	buf_offset += int(filename_len)
+
+	big_file, ok := big_fps[filename]
+	if !ok {
+		panic("Received big commit for unknown file: " + filename)
+	}
+
+	bigstat := UnrealStatUnserialize(string(buf[buf_offset:]))
+	if err = big_file.fp.Close(); err != nil {
+		panic("Cannot close tmp file " + big_file.tmp_name + ": " + err.Error())
+	}
+
+	if err = os.Chmod(big_file.tmp_name, os.FileMode(bigstat.mode)); err != nil {
+		panic("Cannot chmod " + big_file.tmp_name + ": " + err.Error())
+	}
+
+	if err = os.Chtimes(big_file.tmp_name, time.Unix(bigstat.mtime, 0), time.Unix(bigstat.mtime, 0)); err != nil {
+		panic("Cannot set mtime for " + big_file.tmp_name + ": " + err.Error())
+	}
+
+	repo_mutex.Lock()
+	defer repo_mutex.Unlock()
+
+	info_map := getRepoInfo(filepath.Dir(filename))
+	if err = os.Rename(big_file.tmp_name, filename); err != nil {
+		panic("Cannot rename " + big_file.tmp_name + " to " + filename + ": " + err.Error())
+	}
+
+	info_map[filepath.Base(filename)] = bigstat
+	writeRepoInfo(filepath.Dir(filename), info_map)
+}
+
+func processBigAbort(buf []byte, big_fps map[string]BigFile) {
+	filename := string(buf)
+	big_file, ok := big_fps[filename]
+	if !ok {
+		panic("Received big commit for unknown file: " + filename)
+	}
+
+	big_file.fp.Close()
+	os.Remove(big_file.tmp_name)
+}
+
 func applyThread(in_stream io.ReadCloser, out_stream io.WriteCloser, settings Settings) {
 	hostname := settings.host
-
-	var (
-		big_name     string
-		big_tmp_name string
-		big_fp       *os.File
-	)
+	big_fps := make(map[string]BigFile)
 
 	defer func() {
-		if big_fp != nil {
-			big_fp.Close()
-			os.Remove(big_tmp_name)
+		for _, big_file := range big_fps {
+			big_file.fp.Close()
+			os.Remove(big_file.tmp_name)
 		}
 
 		if err := recover(); err != nil {
@@ -486,6 +583,11 @@ func applyThread(in_stream io.ReadCloser, out_stream io.WriteCloser, settings Se
 		}
 
 		action_str := string(action)
+		if is_server {
+			debugLn("Received ", action_str)
+			rcvchan <- true
+		}
+
 		if action_str == ACTION_PING {
 			sendchan <- OutMsg{ACTION_PONG, nil, out_stream}
 		} else if action_str == ACTION_PONG {
@@ -496,41 +598,13 @@ func applyThread(in_stream io.ReadCloser, out_stream io.WriteCloser, settings Se
 			if action_str == ACTION_DIFF {
 				applyRemoteDiff(buf)
 			} else if action_str == ACTION_BIG_INIT {
-				big_name = string(buf)
-				big_tmp_name = REPO_TMP + filepath.Base(big_name)
-				big_fp, err = os.OpenFile(big_tmp_name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0777)
-				if err != nil {
-					panic("Cannot open tmp file " + big_tmp_name + ": " + err.Error())
-				}
+				processBigInit(buf, big_fps)
 			} else if action_str == ACTION_BIG_RCV {
-				if _, err := big_fp.Write(buf); err != nil {
-					panic("Cannot write to tmp file " + big_tmp_name + ": " + err.Error())
-				}
+				processBigRcv(buf, big_fps)
 			} else if action_str == ACTION_BIG_COMMIT {
-				bigstat := UnrealStatUnserialize(string(buf))
-				if err = big_fp.Close(); err != nil {
-					panic("Cannot close tmp file " + big_tmp_name + ": " + err.Error())
-				}
-
-				if err = os.Chmod(big_tmp_name, os.FileMode(bigstat.mode)); err != nil {
-					panic("Cannot chmod " + big_tmp_name + ": " + err.Error())
-				}
-
-				if err = os.Chtimes(big_tmp_name, time.Unix(bigstat.mtime, 0), time.Unix(bigstat.mtime, 0)); err != nil {
-					panic("Cannot set mtime for " + big_tmp_name + ": " + err.Error())
-				}
-
-				repo_mutex.Lock()
-
-				info_map := getRepoInfo(filepath.Dir(big_name))
-				os.Rename(big_tmp_name, big_name)
-				info_map[filepath.Base(big_name)] = bigstat
-				writeRepoInfo(filepath.Dir(big_name), info_map)
-
-				repo_mutex.Unlock()
+				processBigCommit(buf, big_fps)
 			} else if action_str == ACTION_BIG_ABORT {
-				big_fp.Close()
-				os.Remove(big_tmp_name)
+				processBigAbort(buf, big_fps)
 			}
 
 			sendchan <- OutMsg{action_str, buf, out_stream}
@@ -824,6 +898,8 @@ func initialize() {
 		progressLn("Unrealsync starting from ", source_dir)
 	}
 
+	os.RemoveAll(REPO_TMP)
+
 	for _, dir := range []string{REPO_DIR, REPO_FILES, REPO_TMP} {
 		_, err = os.Stat(dir)
 		if err != nil {
@@ -859,7 +935,18 @@ func initialize() {
 func pingThread() {
 	for {
 		sendchan <- OutMsg{ACTION_PING, nil, nil}
-		time.Sleep(time.Minute)
+		time.Sleep(PING_INTERVAL)
+	}
+}
+
+func timeoutThread() {
+	for {
+		select {
+		case <-rcvchan:
+		case <-time.After(PING_INTERVAL * 2):
+			os.Create(REPO_TMP + "deadlock")
+			panic("Double ping interval exceeded: probably a deadlock")
+		}
 	}
 }
 
@@ -973,38 +1060,52 @@ func shouldIgnore(path string) bool {
 	return false
 }
 
-func sendBigFile(file string, stat *UnrealStat) (unreal_err int) {
-	progressLn("Sending big file: ", file, " (", (stat.size / 1024 / 1024), " MiB)")
+// Send big file in chunks:
 
-	fp, err := os.Open(file)
+// ACTION_BIG_INIT  = filename
+// ACTION_BIG_RCV   = filename length (10 bytes) | filename | chunk contents
+// ACTION_BIG_ABORT = filename
+
+func sendBigFile(file_str string, stat *UnrealStat) (unreal_err int) {
+	progressLn("Sending big file: ", file_str, " (", (stat.size / 1024 / 1024), " MiB)")
+
+	fp, err := os.Open(file_str)
 	if err != nil {
-		progressLn("Could not open ", file, ": ", err)
+		progressLn("Could not open ", file_str, ": ", err)
 		return
 	}
 	defer fp.Close()
 
-	sendchan <- OutMsg{ACTION_BIG_INIT, []byte(file), nil}
+	file := []byte(file_str)
 
+	sendchan <- OutMsg{ACTION_BIG_INIT, file, nil}
 	bytes_left := stat.size
 
 	for {
 		buf := make([]byte, MAX_DIFF_SIZE/2)
+		buf_offset := 0
+
+		copy(buf[buf_offset:10], fmt.Sprintf("%010d", len(file)))
+		buf_offset += 10
+
+		copy(buf[buf_offset:len(file)+buf_offset], file)
+		buf_offset += len(file)
 
 		file_stat, err := fp.Stat()
 		if err != nil {
-			progressLn("Cannot stat ", file, " that we are reading right now: ", err.Error())
+			progressLn("Cannot stat ", file_str, " that we are reading right now: ", err.Error())
 			sendchan <- OutMsg{ACTION_BIG_ABORT, []byte(file), nil}
 			unreal_err = ERROR_FATAL
 			return
 		}
 
 		if !StatsEqual(file_stat, *stat) {
-			progressLn("File ", file, " has changed, aborting transfer")
+			progressLn("File ", file_str, " has changed, aborting transfer")
 			sendchan <- OutMsg{ACTION_BIG_ABORT, []byte(file), nil}
 			return
 		}
 
-		n, err := fp.Read(buf)
+		n, err := fp.Read(buf[buf_offset:])
 		if err != nil && err != io.EOF {
 			// if we were unable to read file that we just opened then probably there are some problems with the OS
 			progressLn("Cannot read ", file, ": ", err)
@@ -1013,22 +1114,22 @@ func sendBigFile(file string, stat *UnrealStat) (unreal_err int) {
 			return
 		}
 
-		if n != len(buf) && int64(n) != bytes_left {
+		if n != len(buf)-buf_offset && int64(n) != bytes_left {
 			progressLn("Read different number of bytes than expected from ", file)
 			sendchan <- OutMsg{ACTION_BIG_ABORT, []byte(file), nil}
 			return
 		}
 
-		sendchan <- OutMsg{ACTION_BIG_RCV, buf[0:n], nil}
+		sendchan <- OutMsg{ACTION_BIG_RCV, buf[0 : buf_offset+n], nil}
 
 		if bytes_left -= int64(n); bytes_left == 0 {
 			break
 		}
 	}
 
-	sendchan <- OutMsg{ACTION_BIG_COMMIT, []byte(stat.Serialize()), nil}
+	sendchan <- OutMsg{ACTION_BIG_COMMIT, []byte(fmt.Sprintf("%010d%s%s", len(file), file_str, stat.Serialize())), nil}
 
-	progressLn("Big file ", file, " successfully sent")
+	progressLn("Big file ", file_str, " successfully sent")
 
 	return
 }
@@ -1275,6 +1376,10 @@ func main() {
 					fatalLn("Cannot commit changes at .")
 				}
 				go syncThread()
+				if is_server {
+					go timeoutThread()
+				}
+
 				progressLn("Watcher ready")
 			}
 			continue
