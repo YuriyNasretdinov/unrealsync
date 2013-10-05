@@ -8,51 +8,53 @@ import (
 	"fmt"
 	ini "github.com/glacjay/goini"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
-type Settings struct {
-	excludes map[string]bool
+type (
+	Settings struct {
+		excludes map[string]bool
 
-	username string
-	host     string
-	port     int
+		username string
+		host     string
+		port     int
 
-	dir string
-	os  string
-}
+		dir string
+		os  string
 
-type UnrealStat struct {
-	is_dir  bool
-	is_link bool
-	mode    int16
-	mtime   int64
-	size    int64
-}
+		bidirectional bool
+	}
 
-type BigFile struct {
-	fp       *os.File
-	tmp_name string
-}
+	UnrealStat struct {
+		isDir  bool
+		isLink bool
+		mode   int16
+		mtime  int64
+		size   int64
+	}
 
-type OutMsg struct {
-	action        string
-	data          interface{}
-	source_stream interface{}
-}
+	BigFile struct {
+		fp      *os.File
+		tmpName string
+	}
 
-type ChangeReceiver struct {
-	changeschan chan OutMsg
-	stream      io.WriteCloser
-}
+	OutMsg struct {
+		action       string
+		data         interface{}
+		sourceStream interface{}
+	}
+
+	ChangeReceiver struct {
+		changeschan chan OutMsg
+		stream      io.WriteCloser
+	}
+)
 
 const (
 	ERROR_FATAL = 1
@@ -65,6 +67,7 @@ const (
 	REPO_FILES         = REPO_DIR + "files/"
 	REPO_TMP           = REPO_DIR + "tmp/"
 	REPO_LOCK          = REPO_DIR + "lock"
+	REPO_PID           = REPO_DIR + "pid"
 
 	REPO_SEP = "/\n"
 	DIFF_SEP = "\n------------\n"
@@ -90,37 +93,40 @@ const (
 	SERVER_ALIVE_INTERVAL   = 3
 	SERVER_ALIVE_COUNT_MAX  = 4
 
-	PING_INTERVAL = 5e9
+	PING_INTERVAL = 60e9
 )
 
 var (
-	source_dir     string
-	unrealsync_dir string
-	repo_mutex     sync.Mutex
-	local_diff     [MAX_DIFF_SIZE]byte
-	local_diff_ptr int
+	sourceDir      string
+	unrealsyncDir  string
+	localDiff      [MAX_DIFF_SIZE]byte
+	localDiffPtr   int
 	fschanges      = make(chan string, 1000)
 	dirschan       = make(chan string, 1000)
 	sendchan       = make(chan OutMsg)
 	rcvchan        = make(chan bool)
-	remotediffchan = make(chan []byte, 100)
+	remotediffchan = make(chan []byte, 1)
 	excludes       = map[string]bool{}
 	servers        = map[string]Settings{}
-	is_server_ptr  = flag.Bool("server", false, "Internal parameter used on remote side")
-	is_server      = false
-	is_debug_ptr   = flag.Bool("debug", false, "Turn on debugging information")
-	is_debug       = false
-	hostname_ptr   = flag.String("hostname", "unknown", "Internal parameter used on remote side")
+	isServerPtr    = flag.Bool("server", false, "Internal parameter used on remote side")
+	isServer       = false
+	isDebugPtr     = flag.Bool("debug", false, "Turn on debugging information")
+	isDebug        = false
+	noWatcherPtr   = flag.Bool("no-watcher", false, "Internal parameter used on remote side to disable local watcher")
+	noWatcher      = false
+	noRemotePtr    = flag.Bool("no-remote", false, "Internal parameter used on remote side to disable external events")
+	noRemote       = false
+	hostnamePtr    = flag.String("hostname", "unknown", "Internal parameter used on remote side")
 	hostname       = ""
 	sendstreamlist = list.New()
 )
 
 func (p UnrealStat) Serialize() (res string) {
 	res = ""
-	if p.is_dir {
+	if p.isDir {
 		res += "dir "
 	}
-	if p.is_link {
+	if p.isLink {
 		res += "symlink "
 	}
 
@@ -129,28 +135,30 @@ func (p UnrealStat) Serialize() (res string) {
 }
 
 func StatsEqual(orig os.FileInfo, repo UnrealStat) bool {
-	if repo.is_dir != orig.IsDir() {
+	if repo.isDir != orig.IsDir() {
 		debugLn(orig.Name(), " is not dir")
 		return false
 	}
 
-	if (repo.mode & 0777) != int16(uint32(orig.Mode())&0777) {
-		debugLn(orig.Name(), " modes different")
-		return false
-	}
-
-	if repo.is_link != (orig.Mode()&os.ModeSymlink == os.ModeSymlink) {
+	if repo.isLink != (orig.Mode()&os.ModeSymlink == os.ModeSymlink) {
 		debugLn(orig.Name(), " symlinks different")
 		return false
 	}
 
+	// TODO: better handle symlinks :)
+	// do not check filemode for symlinks because we cannot chmod them either
+	if !repo.isLink && (repo.mode&0777) != int16(uint32(orig.Mode())&0777) {
+		debugLn(orig.Name(), " modes different")
+		return false
+	}
+
 	// you cannot set mtime for a symlink and we do not set mtime for directories
-	if !repo.is_link && !repo.is_dir && repo.mtime != orig.ModTime().Unix() {
+	if !repo.isLink && !repo.isDir && repo.mtime != orig.ModTime().Unix() {
 		debugLn(orig.Name(), " modification time different")
 		return false
 	}
 
-	if !repo.is_dir && repo.size != orig.Size() {
+	if !repo.isDir && repo.size != orig.Size() {
 		debugLn(orig.Name(), " size different")
 		return false
 	}
@@ -161,9 +169,9 @@ func StatsEqual(orig os.FileInfo, repo UnrealStat) bool {
 func UnrealStatUnserialize(input string) (result UnrealStat) {
 	for _, part := range strings.Split(input, " ") {
 		if part == "dir" {
-			result.is_dir = true
+			result.isDir = true
 		} else if part == "symlink" {
-			result.is_link = true
+			result.isLink = true
 		} else if strings.HasPrefix(part, "mode=") {
 			tmp, _ := strconv.ParseInt(part[len("mode="):], 8, 16)
 			result.mode = int16(tmp)
@@ -187,14 +195,14 @@ func UnrealStatFromStat(info os.FileInfo) UnrealStat {
 	}
 }
 
-func _progress(a []interface{}, with_eol bool) {
-	repeat_len := 10 - len(hostname)
-	if repeat_len <= 0 {
-		repeat_len = 1
+func _progress(a []interface{}, withEol bool) {
+	repeatLen := 10 - len(hostname)
+	if repeatLen <= 0 {
+		repeatLen = 1
 	}
-	msg := fmt.Sprint(time.Now().Format("15:04:05"), " ", hostname, "$ ", strings.Repeat(" ", repeat_len))
+	msg := fmt.Sprint(time.Now().Format("15:04:05"), " ", hostname, "$ ", strings.Repeat(" ", repeatLen))
 	msg += fmt.Sprint(a...)
-	if with_eol {
+	if withEol {
 		msg += fmt.Sprint("\n")
 	}
 	fmt.Fprint(os.Stderr, msg)
@@ -214,7 +222,7 @@ func fatalLn(a ...interface{}) {
 }
 
 func debugLn(a ...interface{}) {
-	if is_debug {
+	if isDebug {
 		progressLn(a...)
 	}
 }
@@ -239,38 +247,45 @@ func parseExcludes(excl string) map[string]bool {
 	return result
 }
 
-func parseServerSettings(section string, server_settings map[string]string) Settings {
+func parseServerSettings(section string, serverSettings map[string]string) Settings {
 
 	var (
 		port int = 0
 		err  error
 	)
 
-	if server_settings["port"] != "" {
-		port, err = strconv.Atoi(server_settings["port"])
+	if serverSettings["port"] != "" {
+		port, err = strconv.Atoi(serverSettings["port"])
 		if err != nil {
 			fatalLn("Cannot parse 'port' property in [" + section + "] section of " + REPO_CLIENT_CONFIG + ": " + err.Error())
 		}
 	}
 
-	local_excludes := make(map[string]bool)
+	localExcludes := make(map[string]bool)
 
-	if server_settings["exclude"] != "" {
-		local_excludes = parseExcludes(server_settings["exclude"])
+	if serverSettings["exclude"] != "" {
+		localExcludes = parseExcludes(serverSettings["exclude"])
 	}
 
-	host, ok := server_settings["host"]
+	host, ok := serverSettings["host"]
 	if !ok {
 		host = section
 	}
 
+	bidirectional := true
+	value, ok := serverSettings["bidirectional"]
+	if ok && value == "false" {
+		bidirectional = false
+	}
+
 	return Settings{
-		local_excludes,
-		server_settings["username"],
+		localExcludes,
+		serverSettings["username"],
 		host,
 		port,
-		server_settings["dir"],
-		server_settings["os"],
+		serverSettings["dir"],
+		serverSettings["os"],
+		bidirectional,
 	}
 
 }
@@ -295,22 +310,22 @@ func parseConfig() {
 
 	delete(dict, GENERAL_SECTION)
 
-	for key, server_settings := range dict {
+	for key, serverSettings := range dict {
 		if key == "" {
 			continue
 		}
 
-		if _, ok := server_settings["disabled"]; ok {
+		if _, ok := serverSettings["disabled"]; ok {
 			progressLn("Skipping [" + key + "] as disabled")
 			continue
 		}
 
-		for general_key, general_value := range general {
-			if server_settings[general_key] == "" {
-				server_settings[general_key] = general_value
+		for generalKey, generalValue := range general {
+			if serverSettings[generalKey] == "" {
+				serverSettings[generalKey] = generalValue
 			}
 		}
-		servers[key] = parseServerSettings(key, server_settings)
+		servers[key] = parseServerSettings(key, serverSettings)
 	}
 }
 
@@ -330,6 +345,8 @@ func sshOptions(settings Settings) []string {
 }
 
 func execOrPanic(cmd string, args []string) string {
+	debugLn(cmd, args)
+
 	output, err := exec.Command(cmd, args...).CombinedOutput()
 	if err != nil {
 		progressLn("Cannot ", cmd, " ", args, ", got error: ", err.Error())
@@ -370,7 +387,7 @@ func startServer(settings Settings) {
 	progressLn("Copying unrealsync binary to " + settings.host + "...")
 
 	args = sshOptions(settings)
-	source := unrealsync_dir + "/unrealsync-" + strings.ToLower(uname)
+	source := unrealsyncDir + "/unrealsync-" + strings.ToLower(uname)
 	destination := settings.host + ":" + dir + "/unrealsync"
 	args = append(args, source, destination)
 	execOrPanic("scp", args)
@@ -384,7 +401,7 @@ func startServer(settings Settings) {
 	}
 
 	// TODO: escaping of remote dir
-	args = append(args, "-a", "--delete", source_dir+"/", settings.host+":"+settings.dir+"/")
+	args = append(args, "-a", "--delete", sourceDir+"/", settings.host+":"+settings.dir+"/")
 	execOrPanic("rsync", args)
 
 	progressLn("Launching unrealsync at " + settings.host + "...")
@@ -392,8 +409,11 @@ func startServer(settings Settings) {
 	args = sshOptions(settings)
 	// TODO: escaping
 	flags := "--server --hostname=" + settings.host
-	if is_debug {
+	if isDebug {
 		flags += " --debug"
+	}
+	if !settings.bidirectional {
+		flags += " --no-watcher"
 	}
 	args = append(args, settings.host, dir+"/unrealsync "+flags+" "+settings.dir)
 
@@ -427,14 +447,14 @@ func startServer(settings Settings) {
 	cmd.Wait()
 }
 
-func readResponse(in_stream io.ReadCloser) []byte {
-	length_bytes := make([]byte, 10)
+func readResponse(inStream io.ReadCloser) []byte {
+	lengthBytes := make([]byte, 10)
 
-	if _, err := io.ReadFull(in_stream, length_bytes); err != nil {
+	if _, err := io.ReadFull(inStream, lengthBytes); err != nil {
 		panic("Cannot read diff length in applyThread from " + hostname + ": " + err.Error())
 	}
 
-	length, err := strconv.Atoi(strings.TrimSpace(string(length_bytes)))
+	length, err := strconv.Atoi(strings.TrimSpace(string(lengthBytes)))
 	if err != nil {
 		panic("Incorrect diff length in applyThread from " + hostname + ": " + err.Error())
 	}
@@ -448,7 +468,7 @@ func readResponse(in_stream io.ReadCloser) []byte {
 		panic("Too big diff from " + hostname + ", probably communication error")
 	}
 
-	if _, err := io.ReadFull(in_stream, buf); err != nil {
+	if _, err := io.ReadFull(inStream, buf); err != nil {
 		panic("Cannot read diff from " + hostname)
 	}
 
@@ -457,114 +477,114 @@ func readResponse(in_stream io.ReadCloser) []byte {
 
 func tmpBigName(filename string) string {
 	h := md5.New()
-	return REPO_TMP + "big_" + fmt.Sprintf("%x", h.Sum([]byte(filename)))
+	io.WriteString(h, filename)
+	return REPO_TMP + "big_" + fmt.Sprintf("%x", h.Sum(nil))
 }
 
-func processBigInit(buf []byte, big_fps map[string]BigFile) {
+func processBigInit(buf []byte, bigFps map[string]BigFile) {
 	filename := string(buf)
-	tmp_name := tmpBigName(filename)
-	fp, err := os.OpenFile(tmp_name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0777)
+	tmpName := tmpBigName(filename)
+	fp, err := os.OpenFile(tmpName, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0777)
 	if err != nil {
-		panic("Cannot open tmp file " + tmp_name + ": " + err.Error())
+		panic("Cannot open tmp file " + tmpName + ": " + err.Error())
 	}
 
-	big_fps[filename] = BigFile{fp, tmp_name}
+	bigFps[filename] = BigFile{fp, tmpName}
 }
 
-func processBigRcv(buf []byte, big_fps map[string]BigFile) {
-	buf_offset := 0
+func processBigRcv(buf []byte, bigFps map[string]BigFile) {
+	bufOffset := 0
 
-	filename_len, err := strconv.ParseInt(string(buf[buf_offset:10]), 10, 32)
+	filenameLen, err := strconv.ParseInt(string(buf[bufOffset:10]), 10, 32)
 	if err != nil {
 		panic("Cannot parse big filename length")
 	}
 
-	buf_offset += 10
-	filename := string(buf[buf_offset : buf_offset+int(filename_len)])
-	buf_offset += int(filename_len)
+	bufOffset += 10
+	filename := string(buf[bufOffset : bufOffset+int(filenameLen)])
+	bufOffset += int(filenameLen)
 
-	big_file, ok := big_fps[filename]
+	bigFile, ok := bigFps[filename]
 	if !ok {
 		panic("Received big chunk for unknown file: " + filename)
 	}
 
-	if _, err = big_file.fp.Write(buf[buf_offset:]); err != nil {
-		panic("Cannot write to tmp file " + big_file.tmp_name + ": " + err.Error())
+	if _, err = bigFile.fp.Write(buf[bufOffset:]); err != nil {
+		panic("Cannot write to tmp file " + bigFile.tmpName + ": " + err.Error())
 	}
 }
 
-func processBigCommit(buf []byte, big_fps map[string]BigFile) {
-	buf_offset := 0
+func processBigCommit(buf []byte, bigFps map[string]BigFile) {
+	bufOffset := 0
 
-	filename_len, err := strconv.ParseInt(string(buf[buf_offset:10]), 10, 32)
+	filenameLen, err := strconv.ParseInt(string(buf[bufOffset:10]), 10, 32)
 	if err != nil {
 		panic("Cannot parse big filename length")
 	}
 
-	buf_offset += 10
-	filename := string(buf[buf_offset : buf_offset+int(filename_len)])
-	buf_offset += int(filename_len)
+	bufOffset += 10
+	filename := string(buf[bufOffset : bufOffset+int(filenameLen)])
+	bufOffset += int(filenameLen)
 
-	big_file, ok := big_fps[filename]
+	bigFile, ok := bigFps[filename]
 	if !ok {
 		panic("Received big commit for unknown file: " + filename)
 	}
 
-	bigstat := UnrealStatUnserialize(string(buf[buf_offset:]))
-	if err = big_file.fp.Close(); err != nil {
-		panic("Cannot close tmp file " + big_file.tmp_name + ": " + err.Error())
+	bigstat := UnrealStatUnserialize(string(buf[bufOffset:]))
+	if err = bigFile.fp.Close(); err != nil {
+		panic("Cannot close tmp file " + bigFile.tmpName + ": " + err.Error())
 	}
 
-	if err = os.Chmod(big_file.tmp_name, os.FileMode(bigstat.mode)); err != nil {
-		panic("Cannot chmod " + big_file.tmp_name + ": " + err.Error())
+	if err = os.Chmod(bigFile.tmpName, os.FileMode(bigstat.mode)); err != nil {
+		panic("Cannot chmod " + bigFile.tmpName + ": " + err.Error())
 	}
 
-	if err = os.Chtimes(big_file.tmp_name, time.Unix(bigstat.mtime, 0), time.Unix(bigstat.mtime, 0)); err != nil {
-		panic("Cannot set mtime for " + big_file.tmp_name + ": " + err.Error())
+	if err = os.Chtimes(bigFile.tmpName, time.Unix(bigstat.mtime, 0), time.Unix(bigstat.mtime, 0)); err != nil {
+		panic("Cannot set mtime for " + bigFile.tmpName + ": " + err.Error())
 	}
 
-	repo_mutex.Lock()
-	defer repo_mutex.Unlock()
+	lockRepo()
+	defer unlockRepo()
 
-	info_map := getRepoInfo(filepath.Dir(filename))
-	if err = os.Rename(big_file.tmp_name, filename); err != nil {
-		panic("Cannot rename " + big_file.tmp_name + " to " + filename + ": " + err.Error())
+	os.MkdirAll(filepath.Dir(filename), 0777)
+	if err = os.Rename(bigFile.tmpName, filename); err != nil {
+		panic("Cannot rename " + bigFile.tmpName + " to " + filename + ": " + err.Error())
 	}
 
-	info_map[filepath.Base(filename)] = bigstat
-	writeRepoInfo(filepath.Dir(filename), info_map)
+	commitSingleFile(filename, &bigstat)
 }
 
-func processBigAbort(buf []byte, big_fps map[string]BigFile) {
+func processBigAbort(buf []byte, bigFps map[string]BigFile) {
 	filename := string(buf)
-	big_file, ok := big_fps[filename]
+	bigFile, ok := bigFps[filename]
 	if !ok {
 		panic("Received big commit for unknown file: " + filename)
 	}
 
-	big_file.fp.Close()
-	os.Remove(big_file.tmp_name)
+	bigFile.fp.Close()
+	os.Remove(bigFile.tmpName)
 }
 
-func applyThread(in_stream io.ReadCloser, out_stream io.WriteCloser, settings Settings) {
+func applyThread(inStream io.ReadCloser, outStream io.WriteCloser, settings Settings) {
 	hostname := settings.host
-	big_fps := make(map[string]BigFile)
+	bigFps := make(map[string]BigFile)
 
 	defer func() {
-		for _, big_file := range big_fps {
-			big_file.fp.Close()
-			os.Remove(big_file.tmp_name)
+		for _, bigFile := range bigFps {
+			bigFile.fp.Close()
+			os.Remove(bigFile.tmpName)
 		}
 
 		if err := recover(); err != nil {
-			if is_server {
+			if isServer {
 				progressLn("Server error at ", hostname, ": ", err)
 				fatalLn("Lost connection to remote side (you should not see this message)")
 			}
 
 			progressLn("Error from ", hostname, ": ", err)
 			progressLn("Lost connection to ", hostname)
-			sendchan <- OutMsg{ACTION_DEL_STREAM, true, out_stream}
+			sendchan <- OutMsg{ACTION_DEL_STREAM, true, outStream}
 
 			go func() {
 				time.Sleep(RETRY_INTERVAL * time.Second)
@@ -577,47 +597,50 @@ func applyThread(in_stream io.ReadCloser, out_stream io.WriteCloser, settings Se
 	action := make([]byte, 10)
 
 	for {
-		_, err := io.ReadFull(in_stream, action)
+		_, err := io.ReadFull(inStream, action)
 		if err != nil {
 			panic("Cannot read action in applyThread from " + hostname + ": " + err.Error())
 		}
 
-		action_str := string(action)
-		if is_server {
-			debugLn("Received ", action_str)
+		actionStr := string(action)
+		debugLn("Received ", actionStr)
+		if isServer {
 			rcvchan <- true
 		}
 
-		if action_str == ACTION_PING {
-			sendchan <- OutMsg{ACTION_PONG, nil, out_stream}
-		} else if action_str == ACTION_PONG {
+		if actionStr == ACTION_PING {
+			sendchan <- OutMsg{ACTION_PONG, nil, outStream}
+		} else if actionStr == ACTION_PONG {
 			debugLn(hostname, " reported that it is alive")
 		} else {
-			buf := readResponse(in_stream)
+			buf := readResponse(inStream)
 
-			if action_str == ACTION_DIFF {
+			if actionStr == ACTION_DIFF {
 				applyRemoteDiff(buf)
-			} else if action_str == ACTION_BIG_INIT {
-				processBigInit(buf, big_fps)
-			} else if action_str == ACTION_BIG_RCV {
-				processBigRcv(buf, big_fps)
-			} else if action_str == ACTION_BIG_COMMIT {
-				processBigCommit(buf, big_fps)
-			} else if action_str == ACTION_BIG_ABORT {
-				processBigAbort(buf, big_fps)
+			} else if actionStr == ACTION_BIG_INIT {
+				processBigInit(buf, bigFps)
+			} else if actionStr == ACTION_BIG_RCV {
+				processBigRcv(buf, bigFps)
+			} else if actionStr == ACTION_BIG_COMMIT {
+				processBigCommit(buf, bigFps)
+			} else if actionStr == ACTION_BIG_ABORT {
+				processBigAbort(buf, bigFps)
 			}
 
-			sendchan <- OutMsg{action_str, buf, out_stream}
+			if !isServer {
+				debugLn("Resending diff")
+				sendchan <- OutMsg{actionStr, buf, outStream}
+			}
 		}
 	}
 }
 
-func writeContents(file string, unreal_stat UnrealStat, contents []byte) {
+func writeContents(file string, unrealStat UnrealStat, contents []byte) {
 	stat, err := os.Lstat(file)
 
 	if err == nil {
 		// file already exists, we must delete it if it is symlink or dir because of inability to make atomic rename
-		if stat.IsDir() != unreal_stat.is_dir || stat.Mode()&os.ModeSymlink == os.ModeSymlink {
+		if stat.IsDir() != unrealStat.isDir || stat.Mode()&os.ModeSymlink == os.ModeSymlink {
 			if err = os.RemoveAll(file); err != nil {
 				progressLn("Cannot remove ", file, ": ", err.Error())
 				return
@@ -628,25 +651,25 @@ func writeContents(file string, unreal_stat UnrealStat, contents []byte) {
 		return
 	}
 
-	if unreal_stat.is_dir {
+	if unrealStat.isDir {
 		if err = os.MkdirAll(file, 0777); err != nil {
 			progressLn("Cannot create dir ", file, ": ", err.Error())
 			return
 		}
-	} else if unreal_stat.is_link {
+	} else if unrealStat.isLink {
 		if err = os.Symlink(string(contents), file); err != nil {
 			progressLn("Cannot create symlink ", file, ": ", err.Error())
 			return
 		}
 	} else {
-		writeFile(file, unreal_stat, contents)
+		writeFile(file, unrealStat, contents)
 	}
 }
 
-func writeFile(file string, unreal_stat UnrealStat, contents []byte) {
+func writeFile(file string, unrealStat UnrealStat, contents []byte) {
 	tempnam := REPO_TMP + path.Base(file)
 
-	fp, err := os.OpenFile(tempnam, os.O_CREATE|os.O_TRUNC|os.O_RDWR, os.FileMode(unreal_stat.mode))
+	fp, err := os.OpenFile(tempnam, os.O_CREATE|os.O_TRUNC|os.O_RDWR, os.FileMode(unrealStat.mode))
 	if err != nil {
 		progressLn("Cannot open ", tempnam)
 		return
@@ -659,7 +682,7 @@ func writeFile(file string, unreal_stat UnrealStat, contents []byte) {
 		return
 	}
 
-	if err = fp.Chmod(os.FileMode(unreal_stat.mode)); err != nil {
+	if err = fp.Chmod(os.FileMode(unrealStat.mode)); err != nil {
 		progressLn("Cannot chmod ", tempnam, ": ", err.Error())
 		fp.Close()
 		return
@@ -674,7 +697,7 @@ func writeFile(file string, unreal_stat UnrealStat, contents []byte) {
 		return
 	}
 
-	if err = os.Chtimes(tempnam, time.Unix(unreal_stat.mtime, 0), time.Unix(unreal_stat.mtime, 0)); err != nil {
+	if err = os.Chtimes(tempnam, time.Unix(unrealStat.mtime, 0), time.Unix(unrealStat.mtime, 0)); err != nil {
 		progressLn("Failed to change modification time for ", file, ": ", err.Error())
 	}
 
@@ -684,22 +707,16 @@ func writeFile(file string, unreal_stat UnrealStat, contents []byte) {
 		return
 	}
 
-	debugLn("Wrote ", file, " ", unreal_stat.Serialize())
+	if isDebug {
+		debugLn("Wrote ", file, " ", unrealStat.Serialize())
+	}
 }
 
-func applyRemoteDiff(buf []byte) {
-	repo_mutex.Lock()
-	defer repo_mutex.Unlock()
-
-	progressLn("Received diff, length ", len(buf))
-	if len(buf) < 500 {
-		debugLn("Diff: ", string(buf))
-	}
-
+func applyDiff(buf []byte, writeChanges bool) {
 	var (
-		sep_bytes = []byte(DIFF_SEP)
-		offset    = 0
-		end_pos   = 0
+		sepBytes = []byte(DIFF_SEP)
+		offset   = 0
+		endPos   = 0
 	)
 
 	dirs := make(map[string]map[string]*UnrealStat)
@@ -709,13 +726,13 @@ func applyRemoteDiff(buf []byte) {
 			break
 		}
 
-		if end_pos = bytes.Index(buf[offset:], sep_bytes); end_pos < 0 {
+		if endPos = bytes.Index(buf[offset:], sepBytes); endPos < 0 {
 			break
 		}
 
-		end_pos += offset
-		chunk := buf[offset:end_pos]
-		offset = end_pos + len(sep_bytes)
+		endPos += offset
+		chunk := buf[offset:endPos]
+		offset = endPos + len(sepBytes)
 		op := chunk[0]
 
 		var (
@@ -725,13 +742,13 @@ func applyRemoteDiff(buf []byte) {
 		)
 
 		if op == 'A' {
-			first_line_pos := bytes.IndexByte(chunk, '\n')
-			if first_line_pos < 0 {
+			firstLinePos := bytes.IndexByte(chunk, '\n')
+			if firstLinePos < 0 {
 				fatalLn("No new line in file diff: ", string(chunk))
 			}
 
-			file = chunk[2:first_line_pos]
-			diffstat = UnrealStatUnserialize(string(chunk[first_line_pos+1:]))
+			file = chunk[2:firstLinePos]
+			diffstat = UnrealStatUnserialize(string(chunk[firstLinePos+1:]))
 		} else if op == 'D' {
 			file = chunk[2:]
 		} else {
@@ -740,53 +757,47 @@ func applyRemoteDiff(buf []byte) {
 
 		// TODO: path check
 
-		if op == 'A' && !diffstat.is_dir && diffstat.size > 0 {
+		if op == 'A' && !diffstat.isDir && diffstat.size > 0 {
 			contents = buf[offset : offset+int(diffstat.size)]
 			offset += int(diffstat.size)
 		}
 
-		file_str := string(file)
-		dir := path.Dir(file_str)
+		fileStr := string(file)
+		dir := path.Dir(fileStr)
 
 		if dirs[dir] == nil {
 			dirs[dir] = make(map[string]*UnrealStat)
 		}
 
 		if op == 'A' {
-			writeContents(file_str, diffstat, contents)
-			dirs[dir][path.Base(file_str)] = &diffstat
+			if writeChanges {
+				writeContents(fileStr, diffstat, contents)
+			}
+			dirs[dir][path.Base(fileStr)] = &diffstat
 		} else if op == 'D' {
-			err := os.RemoveAll(string(file))
-			if err != nil {
-				// TODO: better error handling than just print :)
-				progressLn("Cannot remove ", string(file))
+			if writeChanges {
+				err := os.RemoveAll(string(file))
+				if err != nil {
+					// TODO: better error handling than just print :)
+					progressLn("Cannot remove ", string(file))
+				}
 			}
 
-			dirs[dir][path.Base(file_str)] = nil
+			dirs[dir][path.Base(fileStr)] = nil
 		} else {
 			fatalLn("Unknown operation in diff:", op)
 		}
 	}
 
-	for dir, filemap := range dirs {
-		info_map := getRepoInfo(dir)
+	writeRepoChanges(dirs)
+}
 
-		for file, stat := range filemap {
-			dir_path := REPO_FILES + dir + "/" + file
+func applyRemoteDiff(buf []byte) {
+	progressLn("Received diff, length ", len(buf))
 
-			if stat == nil {
-				if _, ok := info_map[file]; ok {
-					delete(info_map, file)
-				} else if err := os.RemoveAll(dir_path); err != nil && !os.IsNotExist(err) {
-					progressLn("Cannot remove ", dir_path, ": ", err.Error())
-				}
-			} else {
-				info_map[file] = *stat
-			}
-		}
-
-		writeRepoInfo(dir, info_map)
-	}
+	lockRepo()
+	applyDiff(buf, true)
+	unlockRepo()
 }
 
 func sendChangesToStreamThread(stream io.WriteCloser, changeschan chan OutMsg) {
@@ -799,8 +810,8 @@ func sendChangesToStreamThread(stream io.WriteCloser, changeschan chan OutMsg) {
 
 	for {
 		msg := <-changeschan
-		source_stream, ok := msg.source_stream.(io.WriteCloser)
-		if ok && source_stream == stream {
+		sourceStream, ok := msg.sourceStream.(io.WriteCloser)
+		if ok && sourceStream == stream {
 			continue
 		}
 
@@ -833,18 +844,18 @@ func sendChangesThread() {
 
 		if msg.action == ACTION_ADD_STREAM {
 			changeschan := make(chan OutMsg)
-			source_stream := msg.source_stream.(io.WriteCloser)
-			sendstreamlist.PushBack(ChangeReceiver{changeschan, source_stream})
-			go sendChangesToStreamThread(source_stream, changeschan)
+			sourceStream := msg.sourceStream.(io.WriteCloser)
+			sendstreamlist.PushBack(ChangeReceiver{changeschan, sourceStream})
+			go sendChangesToStreamThread(sourceStream, changeschan)
 			continue
 		} else if msg.action == ACTION_DEL_STREAM {
-			send_stop := msg.data.(bool)
-			source_stream := msg.source_stream.(io.WriteCloser)
+			sendStop := msg.data.(bool)
+			sourceStream := msg.sourceStream.(io.WriteCloser)
 
 			for e := sendstreamlist.Front(); e != nil; e = e.Next() {
 				receiver := e.Value.(ChangeReceiver)
-				if receiver.stream == source_stream {
-					if send_stop {
+				if receiver.stream == sourceStream {
+					if sendStop {
 						receiver.changeschan <- OutMsg{ACTION_STOP, nil, receiver.stream}
 					}
 					sendstreamlist.Remove(e)
@@ -863,16 +874,18 @@ func initialize() {
 	var err error
 
 	flag.Parse()
-	is_server = *is_server_ptr
-	is_debug = *is_debug_ptr
+	isServer = *isServerPtr
+	isDebug = *isDebugPtr
+	noRemote = *noRemotePtr
+	noWatcher = *noWatcherPtr
 
-	if is_server {
-		hostname = *hostname_ptr
+	if isServer {
+		hostname = *hostnamePtr
 	}
 
 	args := flag.Args()
 
-	unrealsync_dir, err = filepath.Abs(path.Dir(os.Args[0]))
+	unrealsyncDir, err = filepath.Abs(path.Dir(os.Args[0]))
 	if err != nil {
 		fatalLn("Cannot determine unrealsync binary location: " + err.Error())
 	}
@@ -887,15 +900,15 @@ func initialize() {
 		os.Exit(2)
 	}
 
-	source_dir, err = os.Getwd()
+	sourceDir, err = os.Getwd()
 	if err != nil {
 		fatalLn("Cannot get current directory")
 	}
 
-	if is_server {
-		progressLn("Unrealsync server starting at ", source_dir)
+	if isServer {
+		progressLn("Unrealsync server starting at ", sourceDir)
 	} else {
-		progressLn("Unrealsync starting from ", source_dir)
+		progressLn("Unrealsync starting from ", sourceDir)
 	}
 
 	os.RemoveAll(REPO_TMP)
@@ -910,9 +923,41 @@ func initialize() {
 		}
 	}
 
+	if _, err := os.Stat(REPO_PID); err == nil {
+		pid_file, err := os.Open(REPO_PID)
+		if err != nil {
+			fatalLn("Cannot open " + REPO_PID + " for reading: " + err.Error())
+		}
+
+		var pid int
+		_, err = fmt.Fscanf(pid_file, "%d", &pid)
+		if err != nil {
+			fatalLn("Cannot read pid from " + REPO_PID + ": " + err.Error())
+		}
+
+		proc, err := os.FindProcess(pid)
+		if err == nil {
+			proc.Kill()
+		}
+
+		pid_file.Close()
+	}
+
+	pid_file, err := os.OpenFile(REPO_PID, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0666)
+	if err != nil {
+		fatalLn("Cannot open " + REPO_PID + " for writing: " + err.Error())
+	}
+
+	_, err = fmt.Fprint(pid_file, os.Getpid())
+	if err != nil {
+		fatalLn("Cannot write current pid to " + REPO_PID + ": " + err.Error())
+	}
+
+	pid_file.Close()
+
 	go sendChangesThread()
 
-	if !is_server {
+	if !isServer {
 		_, err = os.Stat(REPO_CLIENT_CONFIG)
 		if err != nil {
 			runWizard()
@@ -925,10 +970,15 @@ func initialize() {
 	} else {
 		excludes[".unrealsync"] = true
 		sendchan <- OutMsg{ACTION_ADD_STREAM, nil, os.Stdout}
-		go applyThread(os.Stdin, os.Stdout, Settings{nil, "local", hostname, 0, source_dir, "local-os"})
+		go applyThread(os.Stdin, os.Stdout, Settings{nil, "local", hostname, 0, sourceDir, "local-os", true})
 	}
 
-	go runFsChangesThread(source_dir)
+	if noWatcher {
+		fschanges <- LOCAL_WATCHER_READY
+	} else {
+		go runFsChangesThread(sourceDir)
+	}
+
 	go pingThread()
 }
 
@@ -945,104 +995,26 @@ func timeoutThread() {
 		case <-rcvchan:
 		case <-time.After(PING_INTERVAL * 2):
 			os.Create(REPO_TMP + "deadlock")
-			panic("Double ping interval exceeded: probably a deadlock")
+			progressLn("Server timeout")
+			os.Exit(1)
 		}
 	}
 }
 
 func syncThread() {
-	all_dirs := make(map[string]bool)
+	allDirs := make(map[string]bool)
 	for {
 		for len(dirschan) > 0 {
-			all_dirs[<-dirschan] = true
+			allDirs[<-dirschan] = true
 		}
 
-		if len(all_dirs) > 0 && do_sync(all_dirs) {
+		if len(allDirs) > 0 && doSync(allDirs) {
 			continue
 		}
 
 		time.Sleep(time.Millisecond * 100)
-		all_dirs = make(map[string]bool)
+		allDirs = make(map[string]bool)
 	}
-}
-
-func writeRepoInfo(dir string, info_map map[string]UnrealStat) {
-
-	debugLn("Commiting changes at ", dir)
-
-	old_info_map := getRepoInfo(dir)
-
-	repo_dir := REPO_FILES + dir
-	err := os.MkdirAll(repo_dir, 0777)
-	if err != nil {
-		progressLn("Cannot mkdir(", repo_dir, "): ", err)
-		return
-	}
-
-	filename := repo_dir + "/" + DB_FILE
-	fp, err := os.OpenFile(filename, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0666)
-	if err != nil {
-		progressLn("Cannot open ", filename, " for writing: ", err)
-		return
-	}
-	defer fp.Close()
-
-	result := make([]string, len(info_map)*2)
-
-	i := 0
-	for k, v := range info_map {
-		result[i] = k
-		result[i+1] = v.Serialize()
-		i += 2
-	}
-
-	// Delete deleted directories ;)
-	for k, v := range old_info_map {
-		_, ok := info_map[k]
-		if !ok && v.is_dir {
-			err := os.RemoveAll(repo_dir + "/" + k)
-			if err != nil {
-				progressLn("Cannot delete ", repo_dir, "/", k, ": ", err)
-				return
-			}
-		}
-	}
-
-	debugLn("Writing to ", filename, ": ", result)
-
-	_, err = fp.WriteString(strings.Join(result, REPO_SEP))
-	if err != nil {
-		progressLn("Cannot write to ", filename, ": ", err)
-	}
-}
-
-func getRepoInfo(dir string) (result map[string]UnrealStat) {
-	result = make(map[string]UnrealStat)
-	filename := REPO_FILES + dir + "/" + DB_FILE
-	fp, err := os.Open(filename)
-	if err != nil {
-		// progressLn("Cannot open ", filename, ": ", err)
-		return
-	}
-	defer fp.Close()
-
-	contents, err := ioutil.ReadAll(fp)
-	if err != nil || len(contents) < 2 {
-		// progressLn("Cannot read ", filename, ": ", err)
-		return
-	}
-
-	elements := strings.Split(string(contents), REPO_SEP)
-
-	if len(elements)%2 != 0 {
-		fatalLn("Broken repository file (inconsistent data): ", filename)
-	}
-
-	for i := 0; i < len(elements); i += 2 {
-		result[elements[i]] = UnrealStatUnserialize(elements[i+1])
-	}
-
-	return
 }
 
 func shouldIgnore(path string) bool {
@@ -1066,124 +1038,135 @@ func shouldIgnore(path string) bool {
 // ACTION_BIG_RCV   = filename length (10 bytes) | filename | chunk contents
 // ACTION_BIG_ABORT = filename
 
-func sendBigFile(file_str string, stat *UnrealStat) (unreal_err int) {
-	progressLn("Sending big file: ", file_str, " (", (stat.size / 1024 / 1024), " MiB)")
+func sendBigFile(fileStr string, stat *UnrealStat) (unrealErr int) {
+	progressLn("Sending big file: ", fileStr, " (", (stat.size / 1024 / 1024), " MiB)")
 
-	fp, err := os.Open(file_str)
+	fp, err := os.Open(fileStr)
 	if err != nil {
-		progressLn("Could not open ", file_str, ": ", err)
+		progressLn("Could not open ", fileStr, ": ", err)
 		return
 	}
 	defer fp.Close()
 
-	file := []byte(file_str)
+	commitSingleFile(fileStr, stat)
+
+	unlockRepo()
+	defer lockRepo()
+
+	file := []byte(fileStr)
 
 	sendchan <- OutMsg{ACTION_BIG_INIT, file, nil}
-	bytes_left := stat.size
+	bytesLeft := stat.size
 
 	for {
 		buf := make([]byte, MAX_DIFF_SIZE/2)
-		buf_offset := 0
+		bufOffset := 0
 
-		copy(buf[buf_offset:10], fmt.Sprintf("%010d", len(file)))
-		buf_offset += 10
+		copy(buf[bufOffset:10], fmt.Sprintf("%010d", len(file)))
+		bufOffset += 10
 
-		copy(buf[buf_offset:len(file)+buf_offset], file)
-		buf_offset += len(file)
+		copy(buf[bufOffset:len(file)+bufOffset], file)
+		bufOffset += len(file)
 
-		file_stat, err := fp.Stat()
+		fileStat, err := fp.Stat()
 		if err != nil {
-			progressLn("Cannot stat ", file_str, " that we are reading right now: ", err.Error())
+			progressLn("Cannot stat ", fileStr, " that we are reading right now: ", err.Error())
 			sendchan <- OutMsg{ACTION_BIG_ABORT, []byte(file), nil}
-			unreal_err = ERROR_FATAL
+			unrealErr = ERROR_FATAL
 			return
 		}
 
-		if !StatsEqual(file_stat, *stat) {
-			progressLn("File ", file_str, " has changed, aborting transfer")
+		if !StatsEqual(fileStat, *stat) {
+			progressLn("File ", fileStr, " has changed, aborting transfer")
 			sendchan <- OutMsg{ACTION_BIG_ABORT, []byte(file), nil}
 			return
 		}
 
-		n, err := fp.Read(buf[buf_offset:])
+		n, err := fp.Read(buf[bufOffset:])
 		if err != nil && err != io.EOF {
 			// if we were unable to read file that we just opened then probably there are some problems with the OS
 			progressLn("Cannot read ", file, ": ", err)
 			sendchan <- OutMsg{ACTION_BIG_ABORT, []byte(file), nil}
-			unreal_err = ERROR_FATAL
+			unrealErr = ERROR_FATAL
 			return
 		}
 
-		if n != len(buf)-buf_offset && int64(n) != bytes_left {
+		if n != len(buf)-bufOffset && int64(n) != bytesLeft {
 			progressLn("Read different number of bytes than expected from ", file)
 			sendchan <- OutMsg{ACTION_BIG_ABORT, []byte(file), nil}
 			return
 		}
 
-		sendchan <- OutMsg{ACTION_BIG_RCV, buf[0 : buf_offset+n], nil}
+		sendchan <- OutMsg{ACTION_BIG_RCV, buf[0 : bufOffset+n], nil}
 
-		if bytes_left -= int64(n); bytes_left == 0 {
+		if bytesLeft -= int64(n); bytesLeft == 0 {
 			break
 		}
 	}
 
-	sendchan <- OutMsg{ACTION_BIG_COMMIT, []byte(fmt.Sprintf("%010d%s%s", len(file), file_str, stat.Serialize())), nil}
+	sendchan <- OutMsg{ACTION_BIG_COMMIT, []byte(fmt.Sprintf("%010d%s%s", len(file), fileStr, stat.Serialize())), nil}
 
-	progressLn("Big file ", file_str, " successfully sent")
+	progressLn("Big file ", fileStr, " successfully sent")
 
 	return
 }
 
-func sendDiff() (unreal_err int) {
-	if local_diff_ptr == 0 {
+func sendDiff() (unrealErr int) {
+	if localDiffPtr == 0 {
 		return
 	}
 
-	buf := make([]byte, local_diff_ptr)
-	copy(buf, local_diff[0:local_diff_ptr])
+	unlockRepo()
+
+	buf := make([]byte, localDiffPtr)
+	copy(buf, localDiff[0:localDiffPtr])
 	sendchan <- OutMsg{ACTION_DIFF, buf, nil}
-	local_diff_ptr = 0
+
+	lockRepo()
+	applyDiff(buf, false)
+	localDiffPtr = 0
+
 	return
 }
 
-func addToDiff(file string, stat *UnrealStat) (unreal_err int) {
-	diff_header_str := ""
-	var diff_len int64
+func addToDiff(file string, stat *UnrealStat) (unrealErr int) {
+	diffHeaderStr := ""
+	var diffLen int64
 	var buf []byte
 
 	if stat == nil {
-		diff_header_str += "D " + file + DIFF_SEP
+		diffHeaderStr += "D " + file + DIFF_SEP
 	} else {
-		diff_header_str += "A " + file + "\n" + stat.Serialize() + DIFF_SEP
-		if stat.is_dir == false {
-			diff_len = stat.size
+		diffHeaderStr += "A " + file + "\n" + stat.Serialize() + DIFF_SEP
+		if stat.isDir == false {
+			diffLen = stat.size
 		}
 	}
 
-	diff_header := []byte(diff_header_str)
+	diffHeader := []byte(diffHeaderStr)
 
-	if diff_len > MAX_DIFF_SIZE/2 {
-		unreal_err = sendBigFile(file, stat)
+	if diffLen > MAX_DIFF_SIZE/2 {
+		unrealErr = sendBigFile(file, stat)
 		return
 	}
 
-	if local_diff_ptr+int(diff_len)+len(diff_header) >= MAX_DIFF_SIZE-1 {
-		if unreal_err = sendDiff(); unreal_err > 0 {
+	if localDiffPtr+int(diffLen)+len(diffHeader) >= MAX_DIFF_SIZE-1 {
+		if unrealErr = sendDiff(); unrealErr > 0 {
 			return
 		}
 	}
 
-	if stat != nil && diff_len > 0 {
-		if stat.is_link {
-			buf_str, err := os.Readlink(file)
+	if stat != nil && diffLen > 0 {
+		if stat.isLink {
+			bufStr, err := os.Readlink(file)
 			if err != nil {
 				progressLn("Could not read link " + file)
 				return
 			}
 
-			buf = []byte(buf_str)
+			buf = []byte(bufStr)
 
-			if len(buf) != int(diff_len) {
+			if len(buf) != int(diffLen) {
 				progressLn("Readlink different number of bytes than expected from ", file)
 				return
 			}
@@ -1195,32 +1178,32 @@ func addToDiff(file string, stat *UnrealStat) (unreal_err int) {
 			}
 			defer fp.Close()
 
-			buf = make([]byte, diff_len)
+			buf = make([]byte, diffLen)
 			n, err := fp.Read(buf)
 			if err != nil && err != io.EOF {
 				// if we were unable to read file that we just opened then probably there are some problems with the OS
 				progressLn("Cannot read ", file, ": ", err)
-				unreal_err = ERROR_FATAL
+				unrealErr = ERROR_FATAL
 				return
 			}
 
-			if n != int(diff_len) {
+			if n != int(diffLen) {
 				progressLn("Read different number of bytes than expected from ", file)
 				return
 			}
 		}
 	}
 
-	local_diff_ptr += copy(local_diff[local_diff_ptr:], diff_header)
+	localDiffPtr += copy(localDiff[localDiffPtr:], diffHeader)
 
-	if stat != nil && diff_len > 0 {
-		local_diff_ptr += copy(local_diff[local_diff_ptr:], buf)
+	if stat != nil && diffLen > 0 {
+		localDiffPtr += copy(localDiff[localDiffPtr:], buf)
 	}
 
 	return
 }
 
-func syncDir(dir string, recursive, send_changes bool) (unreal_err int) {
+func syncDir(dir string, recursive, sendChanges bool) (unrealErr int) {
 
 	if shouldIgnore(dir) {
 		return
@@ -1245,27 +1228,27 @@ func syncDir(dir string, recursive, send_changes bool) (unreal_err int) {
 		return
 	}
 
-	repo_info := getRepoInfo(dir)
-	changes_count := 0
+	repoInfo := getRepoInfo(dir)
+	changesCount := 0
 
 	// Detect deletions: we need to do it first because otherwise change from dir to file will be impossible
-	for name, _ := range repo_info {
+	for name, _ := range repoInfo {
 		_, err := os.Lstat(dir + "/" + name)
 		if os.IsNotExist(err) {
-			delete(repo_info, name)
+			delete(repoInfo, name)
 
 			debugLn("Deleted: ", dir, "/", name)
 
-			if send_changes {
-				if unreal_err = addToDiff(dir+"/"+name, nil); unreal_err > 0 {
+			if sendChanges {
+				if unrealErr = addToDiff(dir+"/"+name, nil); unrealErr > 0 {
 					return
 				}
 			}
 
-			changes_count++
+			changesCount++
 		} else if err != nil {
 			progressLn("Could not lstat ", dir, "/", name, ": ", err)
-			unreal_err = ERROR_FATAL // we do not want to try to recover from Permission denied and other weird errors
+			unrealErr = ERROR_FATAL // we do not want to try to recover from Permission denied and other weird errors
 			return
 		}
 	}
@@ -1285,18 +1268,18 @@ func syncDir(dir string, recursive, send_changes bool) (unreal_err int) {
 			if shouldIgnore(info.Name()) {
 				continue
 			}
-			repo_el, ok := repo_info[info.Name()]
-			if !ok || !StatsEqual(info, repo_el) {
+			repoEl, ok := repoInfo[info.Name()]
+			if !ok || !StatsEqual(info, repoEl) {
 
-				if info.IsDir() && (recursive || !ok || !repo_el.is_dir) {
-					if unreal_err = syncDir(dir+"/"+info.Name(), true, send_changes); unreal_err > 0 {
+				if info.IsDir() && (recursive || !ok || !repoEl.isDir) {
+					if unrealErr = syncDir(dir+"/"+info.Name(), true, sendChanges); unrealErr > 0 {
 						return
 					}
 				}
 
-				unreal_stat := UnrealStatFromStat(info)
+				unrealStat := UnrealStatFromStat(info)
 
-				repo_info[info.Name()] = unreal_stat
+				repoInfo[info.Name()] = unrealStat
 
 				prefix := "Changed: "
 				if !ok {
@@ -1304,42 +1287,43 @@ func syncDir(dir string, recursive, send_changes bool) (unreal_err int) {
 				}
 				debugLn(prefix, dir, "/", info.Name())
 
-				if send_changes {
-					if unreal_err = addToDiff(dir+"/"+info.Name(), &unreal_stat); unreal_err > 0 {
+				if sendChanges {
+					if unrealErr = addToDiff(dir+"/"+info.Name(), &unrealStat); unrealErr > 0 {
 						return
 					}
 				}
 
-				changes_count++
+				changesCount++
 			}
 		}
 	}
 
-	if changes_count > 0 {
-		writeRepoInfo(dir, repo_info)
+	// initial commit is done when we do not send any changes
+	if !sendChanges && changesCount > 0 {
+		writeRepoInfo(dir, repoInfo)
 	}
 
 	return
 }
 
-func do_sync(dirs map[string]bool) (should_retry bool) {
-	dirs_list := []string{}
+func doSync(dirs map[string]bool) (shouldRetry bool) {
+	dirsList := []string{}
 	for dir := range dirs {
 		if shouldIgnore(dir) {
 			delete(dirs, dir)
 			continue
 		}
-		dirs_list = append(dirs_list, dir)
+		dirsList = append(dirsList, dir)
 	}
 
 	if len(dirs) == 0 {
 		return
 	}
 
-	progressLn("Changed dirs: ", strings.Join(dirs_list, "; "))
+	progressLn("Changed dirs: ", strings.Join(dirsList, "; "))
 
-	repo_mutex.Lock()
-	defer repo_mutex.Unlock()
+	lockRepo()
+	defer unlockRepo()
 
 	for dir := range dirs {
 		// Upon receiving event we can have 'dir' vanish or become a file
@@ -1349,13 +1333,13 @@ func do_sync(dirs map[string]bool) (should_retry bool) {
 			delete(dirs, dir)
 			continue
 		}
-		unreal_err := syncDir(dir, false, true)
-		if unreal_err == ERROR_FATAL {
+		unrealErr := syncDir(dir, false, true)
+		if unrealErr == ERROR_FATAL {
 			fatalLn("Unrecoverable error, exiting (this should never happen! please file a bug report)")
 		}
 	}
 
-	if unreal_err := sendDiff(); unreal_err > 0 {
+	if unrealErr := sendDiff(); unrealErr > 0 {
 		return
 	}
 
@@ -1364,19 +1348,20 @@ func do_sync(dirs map[string]bool) (should_retry bool) {
 
 func main() {
 	initialize()
-	watcher_ready := false
+	watcherReady := false
 	var err error
 
 	for {
 		path := <-fschanges
-		if !watcher_ready {
+		if !watcherReady {
 			if path == LOCAL_WATCHER_READY {
-				watcher_ready = true
+				watcherReady = true
 				if syncDir(".", true, false) > 0 {
 					fatalLn("Cannot commit changes at .")
 				}
+				progressLn("Initial commit done")
 				go syncThread()
-				if is_server {
+				if isServer {
 					go timeoutThread()
 				}
 
@@ -1386,7 +1371,7 @@ func main() {
 		}
 
 		if filepath.IsAbs(path) {
-			path, err = filepath.Rel(source_dir, path)
+			path, err = filepath.Rel(sourceDir, path)
 			if err != nil {
 				progressLn("Cannot compute relative path: ", err)
 				continue
