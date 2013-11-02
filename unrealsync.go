@@ -29,6 +29,7 @@ type (
 		os  string
 
 		bidirectional bool
+		compression   bool
 	}
 
 	UnrealStat struct {
@@ -196,7 +197,7 @@ func UnrealStatFromStat(info os.FileInfo) UnrealStat {
 }
 
 func _progress(a []interface{}, withEol bool) {
-	repeatLen := 10 - len(hostname)
+	repeatLen := 15 - len(hostname)
 	if repeatLen <= 0 {
 		repeatLen = 1
 	}
@@ -272,11 +273,8 @@ func parseServerSettings(section string, serverSettings map[string]string) Setti
 		host = section
 	}
 
-	bidirectional := true
-	value, ok := serverSettings["bidirectional"]
-	if ok && value == "false" {
-		bidirectional = false
-	}
+	bidirectional := (serverSettings["bidirectional"] == "true")
+	compression := (serverSettings["compression"] != "false")
 
 	return Settings{
 		localExcludes,
@@ -286,6 +284,7 @@ func parseServerSettings(section string, serverSettings map[string]string) Setti
 		serverSettings["dir"],
 		serverSettings["os"],
 		bidirectional,
+		compression,
 	}
 
 }
@@ -330,15 +329,22 @@ func parseConfig() {
 }
 
 func sshOptions(settings Settings) []string {
-	options := []string{"-o", "Compression=yes", "-o", fmt.Sprint("ConnectTimeout=", DEFAULT_CONNECT_TIMEOUT)}
+	options := []string{"-o", fmt.Sprint("ConnectTimeout=", DEFAULT_CONNECT_TIMEOUT)}
 	options = append(options, "-o", fmt.Sprint("ServerAliveInterval=", SERVER_ALIVE_INTERVAL))
 	options = append(options, "-o", fmt.Sprint("ServerAliveCountMax=", SERVER_ALIVE_COUNT_MAX))
+
+	// Batch mode settings for ssh to prevent it from asking its' stupid questions
+	options = append(options, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no")
+	options = append(options, "-o", "UserKnownHostsFile=/dev/null")
 
 	if settings.port > 0 {
 		options = append(options, "-o", fmt.Sprintf("Port=%d", settings.port))
 	}
 	if settings.username != "" {
 		options = append(options, "-o", "User="+settings.username)
+	}
+	if settings.compression {
+		options = append(options, "-o", "Compression=yes")
 	}
 
 	return options
@@ -347,7 +353,7 @@ func sshOptions(settings Settings) []string {
 func execOrPanic(cmd string, args []string) string {
 	debugLn(cmd, args)
 
-	output, err := exec.Command(cmd, args...).CombinedOutput()
+	output, err := exec.Command(cmd, args...).Output()
 	if err != nil {
 		progressLn("Cannot ", cmd, " ", args, ", got error: ", err.Error())
 		progressLn("Command output:\n", string(output))
@@ -370,6 +376,9 @@ func startServer(settings Settings) {
 		}
 	}()
 
+	if settings.bidirectional {
+		progressLn("Bidirectional synchronization to " + settings.host + " is enabled")
+	}
 	progressLn("Creating directories at " + settings.host + "...")
 
 	args := sshOptions(settings)
@@ -396,7 +405,7 @@ func startServer(settings Settings) {
 
 	// TODO: escaping
 	args = []string{"-e", "ssh " + strings.Join(sshOptions(settings), " ")}
-	for mask := range excludes {
+	for mask := range settings.excludes {
 		args = append(args, "--exclude="+mask)
 	}
 
@@ -793,11 +802,15 @@ func applyDiff(buf []byte, writeChanges bool) {
 }
 
 func applyRemoteDiff(buf []byte) {
-	progressLn("Received diff, length ", len(buf))
+	kilobytes := len(buf) / 1024
+
+	progressLn("Received diff, length ", kilobytes, " KiB")
 
 	lockRepo()
 	applyDiff(buf, true)
 	unlockRepo()
+
+	progressLn("Applied diff, length ", kilobytes, " KiB")
 }
 
 func sendChangesToStreamThread(stream io.WriteCloser, changeschan chan OutMsg) {
@@ -970,7 +983,7 @@ func initialize() {
 	} else {
 		excludes[".unrealsync"] = true
 		sendchan <- OutMsg{ACTION_ADD_STREAM, nil, os.Stdout}
-		go applyThread(os.Stdin, os.Stdout, Settings{nil, "local", hostname, 0, sourceDir, "local-os", true})
+		go applyThread(os.Stdin, os.Stdout, Settings{nil, "local", hostname, 0, sourceDir, "local-os", true, true})
 	}
 
 	if noWatcher {
