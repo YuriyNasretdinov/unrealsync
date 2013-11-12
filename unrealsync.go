@@ -408,6 +408,9 @@ func startServer(settings Settings) {
 	for mask := range settings.excludes {
 		args = append(args, "--exclude="+mask)
 	}
+	for mask := range excludes {
+		args = append(args, "--exclude="+mask)
+	}
 
 	// TODO: escaping of remote dir
 	args = append(args, "-a", "--delete", sourceDir+"/", settings.host+":"+settings.dir+"/")
