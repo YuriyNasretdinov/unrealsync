@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -53,6 +54,7 @@ type (
 
 	ChangeReceiver struct {
 		changeschan chan OutMsg
+		host        string
 		stream      io.WriteCloser
 	}
 )
@@ -98,28 +100,29 @@ const (
 )
 
 var (
-	sourceDir      string
-	unrealsyncDir  string
-	localDiff      [MAX_DIFF_SIZE]byte
-	localDiffPtr   int
-	fschanges      = make(chan string, 1000)
-	dirschan       = make(chan string, 1000)
-	sendchan       = make(chan OutMsg)
-	rcvchan        = make(chan bool)
-	remotediffchan = make(chan []byte, 1)
-	excludes       = map[string]bool{}
-	servers        = map[string]Settings{}
-	isServerPtr    = flag.Bool("server", false, "Internal parameter used on remote side")
-	isServer       = false
-	isDebugPtr     = flag.Bool("debug", false, "Turn on debugging information")
-	isDebug        = false
-	noWatcherPtr   = flag.Bool("no-watcher", false, "Internal parameter used on remote side to disable local watcher")
-	noWatcher      = false
-	noRemotePtr    = flag.Bool("no-remote", false, "Internal parameter used on remote side to disable external events")
-	noRemote       = false
-	hostnamePtr    = flag.String("hostname", "unknown", "Internal parameter used on remote side")
-	hostname       = ""
-	sendstreamlist = list.New()
+	sourceDir       string
+	unrealsyncDir   string
+	localDiff       [MAX_DIFF_SIZE]byte
+	localDiffPtr    int
+	fschanges       = make(chan string, 1000)
+	dirschan        = make(chan string, 1000)
+	sendchan        = make(chan OutMsg)
+	rcvchan         = make(chan bool)
+	remotediffchan  = make(chan []byte, 1)
+	excludes        = map[string]bool{}
+	servers         = map[string]Settings{}
+	isServerPtr     = flag.Bool("server", false, "Internal parameter used on remote side")
+	isServer        = false
+	isDebugPtr      = flag.Bool("debug", false, "Turn on debugging information")
+	isDebug         = false
+	noWatcherPtr    = flag.Bool("no-watcher", false, "Internal parameter used on remote side to disable local watcher")
+	noWatcher       = false
+	noRemotePtr     = flag.Bool("no-remote", false, "Internal parameter used on remote side to disable external events")
+	noRemote        = false
+	hostnamePtr     = flag.String("hostname", "unknown", "Internal parameter used on remote side")
+	hostname        = ""
+	sendstreamlist  = list.New()
+	sendstreammutex sync.Mutex
 )
 
 func (p UnrealStat) Serialize() (res string) {
@@ -201,7 +204,7 @@ func _progress(a []interface{}, withEol bool) {
 	if repeatLen <= 0 {
 		repeatLen = 1
 	}
-	msg := fmt.Sprint(time.Now().Format("15:04:05"), " ", hostname, "$ ", strings.Repeat(" ", repeatLen))
+	msg := fmt.Sprint("\r\033[2K", time.Now().Format("15:04:05"), " ", hostname, "$ ", strings.Repeat(" ", repeatLen))
 	msg += fmt.Sprint(a...)
 	if withEol {
 		msg += fmt.Sprint("\n")
@@ -449,7 +452,7 @@ func startServer(settings Settings) {
 		panic("Cannot start command ssh " + strings.Join(args, " ") + ": " + err.Error())
 	}
 
-	sendchan <- OutMsg{ACTION_ADD_STREAM, nil, stdin}
+	sendchan <- OutMsg{ACTION_ADD_STREAM, settings.host, stdin}
 	go applyThread(stdout, stdin, settings)
 
 	if _, err = stdin.Write([]byte(ACTION_PING)); err != nil {
@@ -819,6 +822,13 @@ func applyRemoteDiff(buf []byte) {
 func sendChangesToStreamThread(stream io.WriteCloser, changeschan chan OutMsg) {
 	defer func() {
 		if err := recover(); err != nil {
+			// unlock the sendChangesThread to allow to send diffs to other servers by
+			// reading all our queue so that ACTION_STOP can actually reach sendChangesThread
+			go func() {
+				for _ = range changeschan {
+				}
+			}()
+
 			sendchan <- OutMsg{ACTION_STOP, false, stream}
 		}
 		stream.Close()
@@ -858,11 +868,15 @@ func sendChangesThread() {
 	for {
 		msg := <-sendchan
 
+		sendstreammutex.Lock()
+
 		if msg.action == ACTION_ADD_STREAM {
-			changeschan := make(chan OutMsg)
+			changeschan := make(chan OutMsg, 10)
+			host := msg.data.(string)
 			sourceStream := msg.sourceStream.(io.WriteCloser)
-			sendstreamlist.PushBack(ChangeReceiver{changeschan, sourceStream})
+			sendstreamlist.PushBack(ChangeReceiver{changeschan, host, sourceStream})
 			go sendChangesToStreamThread(sourceStream, changeschan)
+			sendstreammutex.Unlock()
 			continue
 		} else if msg.action == ACTION_DEL_STREAM {
 			sendStop := msg.data.(bool)
@@ -874,15 +888,42 @@ func sendChangesThread() {
 					if sendStop {
 						receiver.changeschan <- OutMsg{ACTION_STOP, nil, receiver.stream}
 					}
+					close(receiver.changeschan)
 					sendstreamlist.Remove(e)
 				}
 			}
+			sendstreammutex.Unlock()
 			continue
 		}
 
 		for e := sendstreamlist.Front(); e != nil; e = e.Next() {
 			e.Value.(ChangeReceiver).changeschan <- msg
 		}
+
+		sendstreammutex.Unlock()
+	}
+}
+
+func printStatusThread() {
+	for {
+		sendstreammutex.Lock()
+
+		statuses := make([]string, 0)
+
+		for e := sendstreamlist.Front(); e != nil; e = e.Next() {
+			receiver := e.Value.(ChangeReceiver)
+			queue := len(receiver.changeschan)
+			if queue > 0 {
+				statuses = append(statuses, fmt.Sprintf("%s (%d diffs)", receiver.host, queue))
+			}
+		}
+
+		if len(statuses) > 0 {
+			progress("Waiting for: ", strings.Join(statuses, "; "))
+		}
+
+		sendstreammutex.Unlock()
+		time.Sleep(time.Millisecond * 300)
 	}
 }
 
@@ -985,7 +1026,7 @@ func initialize() {
 		}
 	} else {
 		excludes[".unrealsync"] = true
-		sendchan <- OutMsg{ACTION_ADD_STREAM, nil, os.Stdout}
+		sendchan <- OutMsg{ACTION_ADD_STREAM, "local", os.Stdout}
 		go applyThread(os.Stdin, os.Stdout, Settings{nil, "local", hostname, 0, sourceDir, "local-os", true, true})
 	}
 
@@ -1379,6 +1420,8 @@ func main() {
 				go syncThread()
 				if isServer {
 					go timeoutThread()
+				} else {
+					go printStatusThread()
 				}
 
 				progressLn("Watcher ready")
