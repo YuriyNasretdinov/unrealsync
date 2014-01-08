@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"container/list"
 	"crypto/md5"
 	"flag"
 	"fmt"
@@ -14,7 +13,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -45,18 +43,6 @@ type (
 		fp      *os.File
 		tmpName string
 	}
-
-	OutMsg struct {
-		action       string
-		data         interface{}
-		sourceStream interface{}
-	}
-
-	ChangeReceiver struct {
-		changeschan chan OutMsg
-		host        string
-		stream      io.WriteCloser
-	}
 )
 
 const (
@@ -69,6 +55,9 @@ const (
 	REPO_SERVER_CONFIG = REPO_DIR + "server_config"
 	REPO_FILES         = REPO_DIR + "files/"
 	REPO_TMP           = REPO_DIR + "tmp/"
+	REPO_LOG           = REPO_DIR + "log/"
+	REPO_LOG_IN        = REPO_LOG + "in/"
+	REPO_LOG_OUT       = REPO_LOG + "out/"
 	REPO_LOCK          = REPO_DIR + "lock"
 	REPO_PID           = REPO_DIR + "pid"
 
@@ -84,10 +73,6 @@ const (
 	ACTION_BIG_COMMIT = "BIGCOMMIT "
 	ACTION_BIG_ABORT  = "BIGABORT  "
 
-	ACTION_ADD_STREAM = "ADDSTREAM " // special action to add new send stream (after host is ready)
-	ACTION_DEL_STREAM = "DELSTREAM " // special action to delete send stream (after losing connection to host)
-	ACTION_STOP       = "STOP      " // special action to stop send stream thread
-
 	DB_FILE = "Unreal.db"
 
 	MAX_DIFF_SIZE           = 2 * 1024 * 1204
@@ -100,30 +85,29 @@ const (
 )
 
 var (
-	sourceDir       string
-	unrealsyncDir   string
-	localDiff       [MAX_DIFF_SIZE]byte
-	localDiffPtr    int
-	fschanges       = make(chan string, 1000)
-	dirschan        = make(chan string, 1000)
-	sendchan        = make(chan OutMsg)
-	rcvchan         = make(chan bool)
-	remotediffchan  = make(chan []byte, 1)
-	excludes        = map[string]bool{}
-	servers         = map[string]Settings{}
-	isServerPtr     = flag.Bool("server", false, "Internal parameter used on remote side")
-	isServer        = false
-	isDebugPtr      = flag.Bool("debug", false, "Turn on debugging information")
-	isDebug         = false
-	noWatcherPtr    = flag.Bool("no-watcher", false, "Internal parameter used on remote side to disable local watcher")
-	noWatcher       = false
-	noRemotePtr     = flag.Bool("no-remote", false, "Internal parameter used on remote side to disable external events")
-	noRemote        = false
-	hostnamePtr     = flag.String("hostname", "unknown", "Internal parameter used on remote side")
-	hostname        = ""
-	sendstreamlist  = list.New()
-	sendstreammutex sync.Mutex
+	sourceDir     string
+	unrealsyncDir string
+	localDiff     [MAX_DIFF_SIZE]byte
+	localDiffPtr  int
+	fschanges     = make(chan string, 1000)
+	dirschan      = make(chan string, 1000)
+	rcvchan       = make(chan bool)
+	excludes      = map[string]bool{}
+	servers       = map[string]Settings{}
+	isServer      = false
+	isDebug       = false
+	noWatcher     = false
+	noRemote      = false
+	hostname      = ""
 )
+
+func init() {
+	flag.BoolVar(&isServer, "server", false, "Internal parameter used on remote side")
+	flag.BoolVar(&isDebug, "debug", false, "Turn on debugging information")
+	flag.BoolVar(&noWatcher, "no-watcher", false, "Internal parameter used on remote side to disable local watcher")
+	flag.BoolVar(&noRemote, "no-remote", false, "Internal parameter used on remote side to disable external events")
+	flag.StringVar(&hostname, "hostname", "", "Internal parameter used on remote side")
+}
 
 func (p UnrealStat) Serialize() (res string) {
 	res = ""
@@ -314,6 +298,9 @@ func parseConfig() {
 
 	for key, serverSettings := range dict {
 		if key == "" {
+			if len(serverSettings) > 0 {
+				progressLn("You should not have top-level settings in " + REPO_CLIENT_CONFIG)
+			}
 			continue
 		}
 
@@ -366,23 +353,23 @@ func execOrPanic(cmd string, args []string) string {
 	return string(output)
 }
 
-func startServer(settings Settings) {
+func startServer(key string, settings Settings) {
 	defer func() {
 		if err := recover(); err != nil {
-			progressLn("Failed to start for server ", settings.host, ": ", err)
+			progressLn("Failed to start for server ", key, ": ", err)
 
 			go func() {
 				time.Sleep(RETRY_INTERVAL * time.Second)
-				progressLn("Reconnecting to " + settings.host)
-				startServer(settings)
+				progressLn("Reconnecting to " + key)
+				startServer(key, settings)
 			}()
 		}
 	}()
 
 	if settings.bidirectional {
-		progressLn("Bidirectional synchronization to " + settings.host + " is enabled")
+		progressLn("NOTICE: Bidirectional synchronization to " + key + " is enabled")
 	}
-	progressLn("Creating directories at " + settings.host + "...")
+	progressLn("Creating directories at " + key + "...")
 
 	args := sshOptions(settings)
 	// TODO: escaping
@@ -392,19 +379,21 @@ func startServer(settings Settings) {
 	output := execOrPanic("ssh", args)
 	uname := strings.TrimSpace(output)
 
-	if uname != "Darwin" && uname != "Linux" {
-		fatalLn("Unknown os at " + settings.host + ":'" + uname + "'")
-	}
-
-	progressLn("Copying unrealsync binary to " + settings.host + "...")
+	progressLn("Copying unrealsync binary to " + key + "...")
 
 	args = sshOptions(settings)
 	source := unrealsyncDir + "/unrealsync-" + strings.ToLower(uname)
-	destination := settings.host + ":" + dir + "/unrealsync"
+
+	if _, err := os.Stat(source); err != nil {
+		panic("Cannot stat " + source + ": " + err.Error() +
+			". Please make sure you have built a corresponding unrealsync server version for your remote OS")
+	}
+
+	destination := key + ":" + dir + "/unrealsync"
 	args = append(args, source, destination)
 	execOrPanic("scp", args)
 
-	progressLn("Initial file sync using rsync at " + settings.host + "...")
+	progressLn("Initial file sync using rsync at " + key + "...")
 
 	// TODO: escaping
 	args = []string{"-e", "ssh " + strings.Join(sshOptions(settings), " ")}
@@ -414,6 +403,8 @@ func startServer(settings Settings) {
 	for mask := range excludes {
 		args = append(args, "--exclude="+mask)
 	}
+
+	outLogPos := getOutLogPosition()
 
 	// TODO: escaping of remote dir
 	args = append(args, "-a", "--delete", sourceDir+"/", settings.host+":"+settings.dir+"/")
@@ -452,14 +443,10 @@ func startServer(settings Settings) {
 		panic("Cannot start command ssh " + strings.Join(args, " ") + ": " + err.Error())
 	}
 
-	sendchan <- OutMsg{ACTION_ADD_STREAM, settings.host, stdin}
-	go applyThread(stdout, stdin, settings)
+	defer cmd.Wait()
 
-	if _, err = stdin.Write([]byte(ACTION_PING)); err != nil {
-		panic("Cannot ping " + settings.host)
-	}
-
-	cmd.Wait()
+	go applyThread(stdout, key)
+	doSendChanges(stdin, outLogPos, key)
 }
 
 func readResponse(inStream io.ReadCloser) []byte {
@@ -581,31 +568,13 @@ func processBigAbort(buf []byte, bigFps map[string]BigFile) {
 	os.Remove(bigFile.tmpName)
 }
 
-func applyThread(inStream io.ReadCloser, outStream io.WriteCloser, settings Settings) {
-	hostname := settings.host
+func applyThread(inStream io.ReadCloser, key string) {
 	bigFps := make(map[string]BigFile)
 
 	defer func() {
 		for _, bigFile := range bigFps {
 			bigFile.fp.Close()
 			os.Remove(bigFile.tmpName)
-		}
-
-		if err := recover(); err != nil {
-			if isServer {
-				progressLn("Server error at ", hostname, ": ", err)
-				fatalLn("Lost connection to remote side (you should not see this message)")
-			}
-
-			progressLn("Error from ", hostname, ": ", err)
-			progressLn("Lost connection to ", hostname)
-			sendchan <- OutMsg{ACTION_DEL_STREAM, true, outStream}
-
-			go func() {
-				time.Sleep(RETRY_INTERVAL * time.Second)
-				progressLn("Reconnecting to " + hostname)
-				startServer(settings)
-			}()
 		}
 	}()
 
@@ -614,7 +583,7 @@ func applyThread(inStream io.ReadCloser, outStream io.WriteCloser, settings Sett
 	for {
 		_, err := io.ReadFull(inStream, action)
 		if err != nil {
-			panic("Cannot read action in applyThread from " + hostname + ": " + err.Error())
+			panic("Cannot read action in applyThread from " + key + ": " + err.Error())
 		}
 
 		actionStr := string(action)
@@ -623,28 +592,28 @@ func applyThread(inStream io.ReadCloser, outStream io.WriteCloser, settings Sett
 			rcvchan <- true
 		}
 
+		buf := readResponse(inStream)
+
 		if actionStr == ACTION_PING {
-			sendchan <- OutMsg{ACTION_PONG, nil, outStream}
+			writeToOutLog(ACTION_PONG, []byte(""), key)
 		} else if actionStr == ACTION_PONG {
-			debugLn(hostname, " reported that it is alive")
-		} else {
-			buf := readResponse(inStream)
+			debugLn(key, " reported that it is alive")
+		} else if actionStr == ACTION_DIFF {
+			applyRemoteDiff(buf)
+		} else if actionStr == ACTION_BIG_INIT {
+			processBigInit(buf, bigFps)
+		} else if actionStr == ACTION_BIG_RCV {
+			processBigRcv(buf, bigFps)
+		} else if actionStr == ACTION_BIG_COMMIT {
+			processBigCommit(buf, bigFps)
+		} else if actionStr == ACTION_BIG_ABORT {
+			processBigAbort(buf, bigFps)
+		}
 
-			if actionStr == ACTION_DIFF {
-				applyRemoteDiff(buf)
-			} else if actionStr == ACTION_BIG_INIT {
-				processBigInit(buf, bigFps)
-			} else if actionStr == ACTION_BIG_RCV {
-				processBigRcv(buf, bigFps)
-			} else if actionStr == ACTION_BIG_COMMIT {
-				processBigCommit(buf, bigFps)
-			} else if actionStr == ACTION_BIG_ABORT {
-				processBigAbort(buf, bigFps)
-			}
-
-			if !isServer {
-				debugLn("Resending diff")
-				sendchan <- OutMsg{actionStr, buf, outStream}
+		if !isServer {
+			debugLn("Resending diff")
+			if err := writeToOutLog(actionStr, buf, key); err != nil {
+				panic("An error occured while writing to out log: " + err.Error())
 			}
 		}
 	}
@@ -819,110 +788,25 @@ func applyRemoteDiff(buf []byte) {
 	progressLn("Applied diff, length ", kilobytes, " KiB")
 }
 
-func sendChangesToStreamThread(stream io.WriteCloser, changeschan chan OutMsg) {
-	defer func() {
-		if err := recover(); err != nil {
-			// unlock the sendChangesThread to allow to send diffs to other servers by
-			// reading all our queue so that ACTION_STOP can actually reach sendChangesThread
-			go func() {
-				for _ = range changeschan {
-				}
-			}()
-
-			sendchan <- OutMsg{ACTION_STOP, false, stream}
-		}
-		stream.Close()
-	}()
-
-	for {
-		msg := <-changeschan
-		sourceStream, ok := msg.sourceStream.(io.WriteCloser)
-		if ok && sourceStream == stream {
-			continue
-		}
-
-		if msg.action == ACTION_STOP {
-			return
-		} else if msg.action == ACTION_PONG || msg.action == ACTION_PING {
-			if _, err := stream.Write([]byte(msg.action)); err != nil {
-				panic("Cannot write " + msg.action + ": " + err.Error())
-			}
-		} else {
-			buf := msg.data.([]byte)
-			if _, err := stream.Write([]byte(msg.action)); err != nil {
-				panic("Cannot write " + msg.action + ": " + err.Error())
-			}
-
-			if _, err := stream.Write([]byte(fmt.Sprintf("%10d", len(buf)))); err != nil {
-				panic("Cannot write length for " + msg.action + ": " + err.Error())
-			}
-
-			if _, err := stream.Write(buf); err != nil {
-				panic("Cannot write data for " + msg.action + ": " + err.Error())
-			}
-		}
-	}
-}
-
-func sendChangesThread() {
-	for {
-		msg := <-sendchan
-
-		sendstreammutex.Lock()
-
-		if msg.action == ACTION_ADD_STREAM {
-			changeschan := make(chan OutMsg, 10)
-			host := msg.data.(string)
-			sourceStream := msg.sourceStream.(io.WriteCloser)
-			sendstreamlist.PushBack(ChangeReceiver{changeschan, host, sourceStream})
-			go sendChangesToStreamThread(sourceStream, changeschan)
-			sendstreammutex.Unlock()
-			continue
-		} else if msg.action == ACTION_DEL_STREAM {
-			sendStop := msg.data.(bool)
-			sourceStream := msg.sourceStream.(io.WriteCloser)
-
-			for e := sendstreamlist.Front(); e != nil; e = e.Next() {
-				receiver := e.Value.(ChangeReceiver)
-				if receiver.stream == sourceStream {
-					if sendStop {
-						receiver.changeschan <- OutMsg{ACTION_STOP, nil, receiver.stream}
-					}
-					close(receiver.changeschan)
-					sendstreamlist.Remove(e)
-				}
-			}
-			sendstreammutex.Unlock()
-			continue
-		}
-
-		for e := sendstreamlist.Front(); e != nil; e = e.Next() {
-			e.Value.(ChangeReceiver).changeschan <- msg
-		}
-
-		sendstreammutex.Unlock()
-	}
-}
-
 func printStatusThread() {
 	for {
-		sendstreammutex.Lock()
+		// sendstreammutex.Lock()
 
-		statuses := make([]string, 0)
+		// statuses := make([]string, 0)
 
-		for e := sendstreamlist.Front(); e != nil; e = e.Next() {
-			receiver := e.Value.(ChangeReceiver)
-			queue := len(receiver.changeschan)
-			if queue > 0 {
-				statuses = append(statuses, fmt.Sprintf("%s (%d diffs)", receiver.host, queue))
-			}
-		}
+		// for e := sendstreamlist.Front(); e != nil; e = e.Next() {
+		// 	receiver := e.Value.(ChangeReceiver)
+		// 	queue := len(receiver.changeschan)
+		// 	if queue > 0 {
+		// 		statuses = append(statuses, fmt.Sprintf("%s (%d diffs)", receiver.host, queue))
+		// 	}
+		// }
 
-		if len(statuses) > 0 {
-			progress("Waiting for: ", strings.Join(statuses, "; "))
-		}
+		// if len(statuses) > 0 {
+		// 	progress("Waiting for: ", strings.Join(statuses, "; "))
+		// }
 
-		sendstreammutex.Unlock()
+		// sendstreammutex.Unlock()
 		time.Sleep(time.Millisecond * 300)
 	}
 }
@@ -931,15 +815,6 @@ func initialize() {
 	var err error
 
 	flag.Parse()
-	isServer = *isServerPtr
-	isDebug = *isDebugPtr
-	noRemote = *noRemotePtr
-	noWatcher = *noWatcherPtr
-
-	if isServer {
-		hostname = *hostnamePtr
-	}
-
 	args := flag.Args()
 
 	unrealsyncDir, err = filepath.Abs(path.Dir(os.Args[0]))
@@ -970,7 +845,7 @@ func initialize() {
 
 	os.RemoveAll(REPO_TMP)
 
-	for _, dir := range []string{REPO_DIR, REPO_FILES, REPO_TMP} {
+	for _, dir := range []string{REPO_DIR, REPO_FILES, REPO_TMP, REPO_LOG, REPO_LOG_IN, REPO_LOG_OUT} {
 		_, err = os.Stat(dir)
 		if err != nil {
 			err = os.Mkdir(dir, 0777)
@@ -1012,8 +887,6 @@ func initialize() {
 
 	pid_file.Close()
 
-	go sendChangesThread()
-
 	if !isServer {
 		_, err = os.Stat(REPO_CLIENT_CONFIG)
 		if err != nil {
@@ -1021,13 +894,13 @@ func initialize() {
 		}
 
 		parseConfig()
-		for _, settings := range servers {
-			go startServer(settings)
+		for key, settings := range servers {
+			go startServer(key, settings)
 		}
 	} else {
 		excludes[".unrealsync"] = true
-		sendchan <- OutMsg{ACTION_ADD_STREAM, "local", os.Stdout}
-		go applyThread(os.Stdin, os.Stdout, Settings{nil, "local", hostname, 0, sourceDir, "local-os", true, true})
+		go applyThread(os.Stdin, "")
+		go doSendChanges(os.Stdout, getOutLogPosition(), "")
 	}
 
 	if noWatcher {
@@ -1037,11 +910,13 @@ func initialize() {
 	}
 
 	go pingThread()
+
+	initializeLogs()
 }
 
 func pingThread() {
 	for {
-		sendchan <- OutMsg{ACTION_PING, nil, nil}
+		writeToOutLog(ACTION_PING, []byte(""), "")
 		time.Sleep(PING_INTERVAL)
 	}
 }
@@ -1095,7 +970,7 @@ func shouldIgnore(path string) bool {
 // ACTION_BIG_RCV   = filename length (10 bytes) | filename | chunk contents
 // ACTION_BIG_ABORT = filename
 
-func sendBigFile(fileStr string, stat *UnrealStat) (unrealErr int) {
+func commitBigFile(fileStr string, stat *UnrealStat) (unrealErr int) {
 	progressLn("Sending big file: ", fileStr, " (", (stat.size / 1024 / 1024), " MiB)")
 
 	fp, err := os.Open(fileStr)
@@ -1107,12 +982,9 @@ func sendBigFile(fileStr string, stat *UnrealStat) (unrealErr int) {
 
 	commitSingleFile(fileStr, stat)
 
-	unlockRepo()
-	defer lockRepo()
-
 	file := []byte(fileStr)
 
-	sendchan <- OutMsg{ACTION_BIG_INIT, file, nil}
+	writeToOutLog(ACTION_BIG_INIT, file, "")
 	bytesLeft := stat.size
 
 	for {
@@ -1128,14 +1000,14 @@ func sendBigFile(fileStr string, stat *UnrealStat) (unrealErr int) {
 		fileStat, err := fp.Stat()
 		if err != nil {
 			progressLn("Cannot stat ", fileStr, " that we are reading right now: ", err.Error())
-			sendchan <- OutMsg{ACTION_BIG_ABORT, []byte(file), nil}
+			writeToOutLog(ACTION_BIG_ABORT, []byte(file), "")
 			unrealErr = ERROR_FATAL
 			return
 		}
 
 		if !StatsEqual(fileStat, *stat) {
 			progressLn("File ", fileStr, " has changed, aborting transfer")
-			sendchan <- OutMsg{ACTION_BIG_ABORT, []byte(file), nil}
+			writeToOutLog(ACTION_BIG_ABORT, []byte(file), "")
 			return
 		}
 
@@ -1143,43 +1015,44 @@ func sendBigFile(fileStr string, stat *UnrealStat) (unrealErr int) {
 		if err != nil && err != io.EOF {
 			// if we were unable to read file that we just opened then probably there are some problems with the OS
 			progressLn("Cannot read ", file, ": ", err)
-			sendchan <- OutMsg{ACTION_BIG_ABORT, []byte(file), nil}
+			writeToOutLog(ACTION_BIG_ABORT, []byte(file), "")
 			unrealErr = ERROR_FATAL
 			return
 		}
 
 		if n != len(buf)-bufOffset && int64(n) != bytesLeft {
 			progressLn("Read different number of bytes than expected from ", file)
-			sendchan <- OutMsg{ACTION_BIG_ABORT, []byte(file), nil}
+			writeToOutLog(ACTION_BIG_ABORT, []byte(file), "")
 			return
 		}
 
-		sendchan <- OutMsg{ACTION_BIG_RCV, buf[0 : bufOffset+n], nil}
+		writeToOutLog(ACTION_BIG_RCV, buf[0:bufOffset+n], "")
 
 		if bytesLeft -= int64(n); bytesLeft == 0 {
 			break
 		}
 	}
 
-	sendchan <- OutMsg{ACTION_BIG_COMMIT, []byte(fmt.Sprintf("%010d%s%s", len(file), fileStr, stat.Serialize())), nil}
+	writeToOutLog(ACTION_BIG_COMMIT, []byte(fmt.Sprintf("%010d%s%s", len(file), fileStr, stat.Serialize())), "")
 
 	progressLn("Big file ", fileStr, " successfully sent")
 
 	return
 }
 
-func sendDiff() (unrealErr int) {
+// Must be inside a repo lock
+func commitDiff() (unrealErr int) {
 	if localDiffPtr == 0 {
 		return
 	}
 
-	unlockRepo()
+	buf := localDiff[0:localDiffPtr]
+	if err := writeToOutLog(ACTION_DIFF, buf, ""); err != nil {
+		progressLn("An error occured while writing to out log: ", err.Error(), ". Trying again in a second")
+		time.Sleep(time.Second)
+		return
+	}
 
-	buf := make([]byte, localDiffPtr)
-	copy(buf, localDiff[0:localDiffPtr])
-	sendchan <- OutMsg{ACTION_DIFF, buf, nil}
-
-	lockRepo()
 	applyDiff(buf, false)
 	localDiffPtr = 0
 
@@ -1203,12 +1076,12 @@ func addToDiff(file string, stat *UnrealStat) (unrealErr int) {
 	diffHeader := []byte(diffHeaderStr)
 
 	if diffLen > MAX_DIFF_SIZE/2 {
-		unrealErr = sendBigFile(file, stat)
+		unrealErr = commitBigFile(file, stat)
 		return
 	}
 
 	if localDiffPtr+int(diffLen)+len(diffHeader) >= MAX_DIFF_SIZE-1 {
-		if unrealErr = sendDiff(); unrealErr > 0 {
+		if unrealErr = commitDiff(); unrealErr > 0 {
 			return
 		}
 	}
@@ -1355,7 +1228,7 @@ func syncDir(dir string, recursive, sendChanges bool) (unrealErr int) {
 		}
 	}
 
-	// initial commit is done when we do not send any changes
+	// initial commit is done when we do not send any changes (other commits are done upon sending diff)
 	if !sendChanges && changesCount > 0 {
 		writeRepoInfo(dir, repoInfo)
 	}
@@ -1396,7 +1269,7 @@ func doSync(dirs map[string]bool) (shouldRetry bool) {
 		}
 	}
 
-	if unrealErr := sendDiff(); unrealErr > 0 {
+	if unrealErr := commitDiff(); unrealErr > 0 {
 		return
 	}
 
