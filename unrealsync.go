@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -90,8 +89,8 @@ var (
 	unrealsyncDir string
 	localDiff     [MAX_DIFF_SIZE]byte
 	localDiffPtr  int
-	fschanges     = make(chan string, 1000)
-	dirschan      = make(chan string, 1000)
+	fschanges     = make(chan string, 10000)
+	dirschan      = make(chan string, 10000)
 	rcvchan       = make(chan bool)
 	excludes      = map[string]bool{}
 	servers       = map[string]Settings{}
@@ -103,8 +102,6 @@ var (
 )
 
 func init() {
-	runtime.LockOSThread()
-
 	flag.BoolVar(&isServer, "server", false, "Internal parameter used on remote side")
 	flag.BoolVar(&isDebug, "debug", false, "Turn on debugging information")
 	flag.BoolVar(&noWatcher, "no-watcher", false, "Internal parameter used on remote side to disable local watcher")
@@ -462,7 +459,7 @@ func startServer(key string, settings Settings) {
 	defer cmd.Wait()
 
 	go applyThread(stdout, key)
-	doSendChanges(stdin, outLogPos, key)
+	panic("Could not send changes: " + doSendChanges(stdin, outLogPos, key).Error())
 }
 
 func readResponse(inStream io.ReadCloser) []byte {
@@ -808,29 +805,6 @@ func applyRemoteDiff(buf []byte) {
 	progressLn("Applied diff, length ", kilobytes, " KiB")
 }
 
-func printStatusThread() {
-	for {
-		// sendstreammutex.Lock()
-
-		// statuses := make([]string, 0)
-
-		// for e := sendstreamlist.Front(); e != nil; e = e.Next() {
-		// 	receiver := e.Value.(ChangeReceiver)
-		// 	queue := len(receiver.changeschan)
-		// 	if queue > 0 {
-		// 		statuses = append(statuses, fmt.Sprintf("%s (%d diffs)", receiver.host, queue))
-		// 	}
-		// }
-
-		// if len(statuses) > 0 {
-		// 	progress("Waiting for: ", strings.Join(statuses, "; "))
-		// }
-
-		// sendstreammutex.Unlock()
-		time.Sleep(time.Millisecond * 300)
-	}
-}
-
 func initialize() {
 	var err error
 
@@ -948,18 +922,32 @@ func timeoutThread() {
 }
 
 func syncThread() {
-	allDirs := make(map[string]bool)
-	for {
-		for len(dirschan) > 0 {
-			allDirs[<-dirschan] = true
-		}
-
-		if len(allDirs) > 0 && doSync(allDirs) {
+	for dir := range dirschan {
+		if shouldIgnore(dir) {
 			continue
 		}
 
-		time.Sleep(time.Millisecond * 100)
-		allDirs = make(map[string]bool)
+		// Upon receiving event we can have 'dir' vanish or become a file
+		// We should not even try to process them
+		stat, err := os.Lstat(dir)
+		if err != nil || !stat.IsDir() {
+			continue
+		}
+
+		progressLn("Changed dir: ", dir)
+
+		lockRepo()
+
+		unrealErr := syncDir(dir, false, true)
+		if unrealErr == ERROR_FATAL {
+			fatalLn("Unrecoverable error, exiting (this should never happen! please file a bug report)")
+		}
+
+		if unrealErr := commitDiff(); unrealErr > 0 {
+			fatalLn("Could not commit diff: fatal error")
+		}
+
+		unlockRepo()
 	}
 }
 
@@ -1245,46 +1233,6 @@ func syncDir(dir string, recursive, sendChanges bool) (unrealErr int) {
 	// initial commit is done when we do not send any changes (other commits are done upon sending diff)
 	if !sendChanges && changesCount > 0 {
 		writeRepoInfo(dir, repoInfo)
-	}
-
-	return
-}
-
-func doSync(dirs map[string]bool) (shouldRetry bool) {
-	dirsList := []string{}
-	for dir := range dirs {
-		if shouldIgnore(dir) {
-			delete(dirs, dir)
-			continue
-		}
-		dirsList = append(dirsList, dir)
-	}
-
-	if len(dirs) == 0 {
-		return
-	}
-
-	progressLn("Changed dirs: ", strings.Join(dirsList, "; "))
-
-	lockRepo()
-	defer unlockRepo()
-
-	for dir := range dirs {
-		// Upon receiving event we can have 'dir' vanish or become a file
-		// We should not even try to process them
-		stat, err := os.Lstat(dir)
-		if err != nil || !stat.IsDir() {
-			delete(dirs, dir)
-			continue
-		}
-		unrealErr := syncDir(dir, false, true)
-		if unrealErr == ERROR_FATAL {
-			fatalLn("Unrecoverable error, exiting (this should never happen! please file a bug report)")
-		}
-	}
-
-	if unrealErr := commitDiff(); unrealErr > 0 {
-		return
 	}
 
 	return

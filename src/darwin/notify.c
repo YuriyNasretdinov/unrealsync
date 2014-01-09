@@ -36,7 +36,7 @@ void initFSEvents(const char *path) {
 	                             pathsToWatch,
 	                             kFSEventStreamEventIdSinceNow, /* Or a previous event ID */
 	                             latency,
-	                             kFSEventStreamCreateFlagNone /* Flags explained in reference */
+	                             kFSEventStreamCreateFlagNone|kFSEventStreamCreateFlagNoDefer /* Flags explained in reference */
 	                             );
 	
 	CFRelease(pathsToWatch);

@@ -22,6 +22,9 @@ var (
 	outLogName  string
 	outLogMutex sync.Mutex
 	outLogPos   int64
+
+	posMap      map[string]int64
+	posMapMutex sync.Mutex
 )
 
 func initializeLogs() {
@@ -32,6 +35,8 @@ func initializeLogs() {
 	if err != nil {
 		fatalLn("Cannot open ", outLogName, ": ", err.Error())
 	}
+
+	posMap = make(map[string]int64)
 }
 
 func writeToOutLog(action string, buf []byte, key string) (err error) {
@@ -70,6 +75,10 @@ func doSendChanges(stream io.Writer, pos int64, key string) (err error) {
 	for {
 		var localOutLogPos int64
 
+		posMapMutex.Lock()
+		posMap[key] = pos
+		posMapMutex.Unlock()
+
 		outLogMutex.Lock()
 		localOutLogPos = outLogPos
 		outLogMutex.Unlock()
@@ -105,6 +114,37 @@ func doSendChanges(stream io.Writer, pos int64, key string) (err error) {
 		if _, err = stream.Write(buf[0:bufLen]); err != nil {
 			return
 		}
+	}
+}
+
+func printStatusThread() {
+
+	previous_length := 0
+
+	for {
+		statuses := make([]string, 0)
+
+		outLogMutex.Lock()
+		curPos := outLogPos
+		outLogMutex.Unlock()
+
+		posMapMutex.Lock()
+		for key, pos := range posMap {
+			if curPos-pos > 1024 { // exclude just pings
+				statuses = append(statuses, fmt.Sprintf("%s (%d KiB)", key, (curPos-pos)/1024))
+			}
+		}
+		posMapMutex.Unlock()
+
+		if len(statuses) > 0 {
+			progress("Pending diffs: ", strings.Join(statuses, "; "))
+		} else if previous_length > 0 {
+			progress("All diffs were sent")
+		}
+
+		previous_length = len(statuses)
+
+		time.Sleep(time.Millisecond * 300)
 	}
 }
 
