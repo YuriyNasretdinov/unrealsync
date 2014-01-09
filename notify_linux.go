@@ -1,10 +1,8 @@
+// +build linux
+
 package main
 
 /*
-#cgo linux CFLAGS: -D__LINUX__
-#cgo darwin CFLAGS: -D__DARWIN__
-#cgo darwin LDFLAGS: -framework CoreFoundation -framework CoreServices
-
 extern void doRun(char *path);
 extern void free(void *pointer);
 */

@@ -21,6 +21,7 @@ var (
 	outLogFp    *os.File
 	outLogName  string
 	outLogMutex sync.Mutex
+	outLogPos   int64
 )
 
 func initializeLogs() {
@@ -35,8 +36,13 @@ func initializeLogs() {
 
 func writeToOutLog(action string, buf []byte, key string) (err error) {
 	outLogMutex.Lock()
+	defer outLogMutex.Unlock()
 	_, err = fmt.Fprintf(outLogFp, "%10d%s%s%10d%s", len(key), key, action, len(buf), buf)
-	outLogMutex.Unlock()
+	if err != nil {
+		return
+	}
+
+	outLogPos, err = outLogFp.Seek(0, os.SEEK_CUR)
 	return
 }
 
@@ -47,14 +53,14 @@ func getOutLogPosition() (n int64) {
 	return
 }
 
-func doSendChanges(stream io.Writer, outLogPos int64, key string) (err error) {
+func doSendChanges(stream io.Writer, pos int64, key string) (err error) {
 	fp, err := os.Open(outLogName)
 	if err != nil {
 		return
 	}
 	defer fp.Close()
 
-	if _, err = fp.Seek(outLogPos, os.SEEK_SET); err != nil {
+	if _, err = fp.Seek(pos, os.SEEK_SET); err != nil {
 		return
 	}
 
@@ -62,7 +68,18 @@ func doSendChanges(stream io.Writer, outLogPos int64, key string) (err error) {
 	lenbuf := make([]byte, 10)
 
 	for {
-		if outLogPos, err = fp.Seek(0, os.SEEK_CUR); err != nil {
+		var localOutLogPos int64
+
+		outLogMutex.Lock()
+		localOutLogPos = outLogPos
+		outLogMutex.Unlock()
+
+		if pos == localOutLogPos {
+			time.Sleep(time.Millisecond * 20)
+			continue
+		}
+
+		if pos, err = fp.Seek(0, os.SEEK_CUR); err != nil {
 			return
 		}
 
@@ -80,7 +97,7 @@ func doSendChanges(stream io.Writer, outLogPos int64, key string) (err error) {
 
 		if status == READ_STATUS_NO_DATA {
 			err = nil
-			fp.Seek(outLogPos, os.SEEK_SET)
+			fp.Seek(pos, os.SEEK_SET)
 			time.Sleep(time.Millisecond * 100)
 			continue
 		}

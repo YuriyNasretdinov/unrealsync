@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -102,6 +103,8 @@ var (
 )
 
 func init() {
+	runtime.LockOSThread()
+
 	flag.BoolVar(&isServer, "server", false, "Internal parameter used on remote side")
 	flag.BoolVar(&isDebug, "debug", false, "Turn on debugging information")
 	flag.BoolVar(&noWatcher, "no-watcher", false, "Internal parameter used on remote side to disable local watcher")
@@ -188,7 +191,11 @@ func _progress(a []interface{}, withEol bool) {
 	if repeatLen <= 0 {
 		repeatLen = 1
 	}
-	msg := fmt.Sprint("\r\033[2K", time.Now().Format("15:04:05"), " ", hostname, "$ ", strings.Repeat(" ", repeatLen))
+	now := time.Now()
+
+	msg := "\r\033[2K"
+	msg += fmt.Sprintf("%s.%09d ", now.Format("15:04:05"), now.Nanosecond())
+	msg += fmt.Sprint(" ", hostname, "$ ", strings.Repeat(" ", repeatLen))
 	msg += fmt.Sprint(a...)
 	if withEol {
 		msg += fmt.Sprint("\n")
@@ -379,19 +386,28 @@ func startServer(key string, settings Settings) {
 	output := execOrPanic("ssh", args)
 	uname := strings.TrimSpace(output)
 
-	progressLn("Copying unrealsync binary to " + key + "...")
+	progressLn("Copying unrealsync binaries to " + key + "...")
 
-	args = sshOptions(settings)
-	source := unrealsyncDir + "/unrealsync-" + strings.ToLower(uname)
+	unameLower := strings.ToLower(uname)
 
-	if _, err := os.Stat(source); err != nil {
-		panic("Cannot stat " + source + ": " + err.Error() +
-			". Please make sure you have built a corresponding unrealsync server version for your remote OS")
+	names := []string{"/unrealsync-" + unameLower}
+	if unameLower == "darwin" {
+		names = append(names, "notify-"+unameLower)
 	}
 
-	destination := key + ":" + dir + "/unrealsync"
-	args = append(args, source, destination)
-	execOrPanic("scp", args)
+	for _, name := range names {
+		args = sshOptions(settings)
+		source := unrealsyncDir + name
+
+		if _, err := os.Stat(source); err != nil {
+			panic("Cannot stat " + source + ": " + err.Error() +
+				". Please make sure you have built a corresponding unrealsync server version for your remote OS")
+		}
+
+		destination := key + ":" + dir + "/unrealsync"
+		args = append(args, source, destination)
+		execOrPanic("scp", args)
+	}
 
 	progressLn("Initial file sync using rsync at " + key + "...")
 
@@ -575,6 +591,10 @@ func applyThread(inStream io.ReadCloser, key string) {
 		for _, bigFile := range bigFps {
 			bigFile.fp.Close()
 			os.Remove(bigFile.tmpName)
+		}
+
+		if r := recover(); r != nil {
+			progressLn("Error occured for ", key, ": ", r)
 		}
 	}()
 
@@ -887,6 +907,8 @@ func initialize() {
 
 	pid_file.Close()
 
+	initializeLogs()
+
 	if !isServer {
 		_, err = os.Stat(REPO_CLIENT_CONFIG)
 		if err != nil {
@@ -903,15 +925,7 @@ func initialize() {
 		go doSendChanges(os.Stdout, getOutLogPosition(), "")
 	}
 
-	if noWatcher {
-		fschanges <- LOCAL_WATCHER_READY
-	} else {
-		go runFsChangesThread(sourceDir)
-	}
-
 	go pingThread()
-
-	initializeLogs()
 }
 
 func pingThread() {
@@ -1276,8 +1290,7 @@ func doSync(dirs map[string]bool) (shouldRetry bool) {
 	return
 }
 
-func main() {
-	initialize()
+func runWatcherLoop() {
 	watcherReady := false
 	var err error
 
@@ -1324,5 +1337,17 @@ func main() {
 		}
 
 		dirschan <- path
+	}
+}
+
+func main() {
+	initialize()
+
+	if noWatcher {
+		fschanges <- LOCAL_WATCHER_READY
+		runWatcherLoop()
+	} else {
+		go runWatcherLoop()
+		runFsChangesThread(sourceDir) // fs changes thread must be main thread on mac os x, sadly
 	}
 }
