@@ -81,7 +81,8 @@ const (
 	SERVER_ALIVE_INTERVAL   = 3
 	SERVER_ALIVE_COUNT_MAX  = 4
 
-	PING_INTERVAL = 60e9
+	PING_INTERVAL     = 60e9
+	AGGREGATE_TIMEOUT = 20 * time.Millisecond
 )
 
 var (
@@ -922,32 +923,45 @@ func timeoutThread() {
 }
 
 func syncThread() {
-	for dir := range dirschan {
-		if shouldIgnore(dir) {
-			continue
+	allDirs := make(map[string]bool)
+	for {
+		for len(dirschan) > 0 {
+			allDirs[<-dirschan] = true
 		}
 
-		// Upon receiving event we can have 'dir' vanish or become a file
-		// We should not even try to process them
-		stat, err := os.Lstat(dir)
-		if err != nil || !stat.IsDir() {
-			continue
+		if len(allDirs) > 0 {
+			for dir := range allDirs {
+				if shouldIgnore(dir) {
+					continue
+				}
+
+				// Upon receiving event we can have 'dir' vanish or become a file
+				// We should not even try to process them
+				stat, err := os.Lstat(dir)
+				if err != nil || !stat.IsDir() {
+					continue
+				}
+
+				progressLn("Changed dir: ", dir)
+
+				lockRepo()
+
+				unrealErr := syncDir(dir, false, true)
+				if unrealErr == ERROR_FATAL {
+					fatalLn("Unrecoverable error, exiting (this should never happen! please file a bug report)")
+				}
+
+				if unrealErr := commitDiff(); unrealErr > 0 {
+					fatalLn("Could not commit diff: fatal error")
+				}
+
+				unlockRepo()
+			}
+		} else {
+			time.Sleep(AGGREGATE_TIMEOUT)
 		}
 
-		progressLn("Changed dir: ", dir)
-
-		lockRepo()
-
-		unrealErr := syncDir(dir, false, true)
-		if unrealErr == ERROR_FATAL {
-			fatalLn("Unrecoverable error, exiting (this should never happen! please file a bug report)")
-		}
-
-		if unrealErr := commitDiff(); unrealErr > 0 {
-			fatalLn("Could not commit diff: fatal error")
-		}
-
-		unlockRepo()
+		allDirs = make(map[string]bool)
 	}
 }
 
