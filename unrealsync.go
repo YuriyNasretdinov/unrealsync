@@ -402,7 +402,7 @@ func startServer(key string, settings Settings) {
 				". Please make sure you have built a corresponding unrealsync server version for your remote OS")
 		}
 
-		destination := key + ":" + dir + "/unrealsync"
+		destination := key + ":" + dir + strings.TrimSuffix(name, "-"+unameLower)
 		args = append(args, source, destination)
 		execOrPanic("scp", args)
 	}
