@@ -390,7 +390,7 @@ func startServer(key string, settings Settings) {
 
 	names := []string{"/unrealsync-" + unameLower}
 	if unameLower == "darwin" {
-		names = append(names, "notify-"+unameLower)
+		names = append(names, "/notify-"+unameLower)
 	}
 
 	for _, name := range names {
