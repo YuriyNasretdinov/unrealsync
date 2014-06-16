@@ -377,7 +377,13 @@ static bool process_inotify_event(struct inotify_event* event) {
 
 
 bool process_inotify_input() {
-  ssize_t len = read(inotify_fd, event_buf, EVENT_BUF_LEN);
+  ssize_t len;
+  do {
+    len = read(inotify_fd, event_buf, EVENT_BUF_LEN);
+    if (len >= 0 || errno != EINTR) break;
+    userlog(LOG_ERR, "read: %s restarting", strerror(errno));
+    usleep(50000);
+  } while (1);
   if (len < 0) {
     userlog(LOG_ERR, "read: %s", strerror(errno));
     return false;
