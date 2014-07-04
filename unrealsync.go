@@ -347,11 +347,14 @@ func sshOptions(settings Settings) []string {
 
 func execOrPanic(cmd string, args []string) string {
 	debugLn(cmd, args)
+	var bufErr bytes.Buffer
+	command := exec.Command(cmd, args...)
+	command.Stderr = &bufErr
+	output, err := command.Output()
 
-	output, err := exec.Command(cmd, args...).Output()
 	if err != nil {
 		progressLn("Cannot ", cmd, " ", args, ", got error: ", err.Error())
-		progressLn("Command output:\n", string(output))
+		progressLn("Command output:\n", string(output), "\nstderr:\n", bufErr.String())
 		panic("Command exited with non-zero code")
 	}
 
