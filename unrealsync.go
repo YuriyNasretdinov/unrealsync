@@ -933,6 +933,8 @@ func syncThread() {
 		}
 
 		if len(allDirs) > 0 {
+			lockRepo()
+
 			for dir := range allDirs {
 				if shouldIgnore(dir) {
 					continue
@@ -947,19 +949,17 @@ func syncThread() {
 
 				progressLn("Changed dir: ", dir)
 
-				lockRepo()
-
 				unrealErr := syncDir(dir, false, true)
 				if unrealErr == ERROR_FATAL {
 					fatalLn("Unrecoverable error, exiting (this should never happen! please file a bug report)")
 				}
-
-				if unrealErr := commitDiff(); unrealErr > 0 {
-					fatalLn("Could not commit diff: fatal error")
-				}
-
-				unlockRepo()
 			}
+
+			if unrealErr := commitDiff(); unrealErr > 0 {
+				fatalLn("Could not commit diff: fatal error")
+			}
+
+			unlockRepo()
 		} else {
 			time.Sleep(AGGREGATE_TIMEOUT)
 		}
