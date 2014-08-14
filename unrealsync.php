@@ -364,7 +364,7 @@ class Unrealsync
 
     private function _getSshOptions($options)
     {
-        $cmd = " -C -o BatchMode=yes ";
+        $cmd = " -C -o BatchMode=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no ";
         if (!empty($options['username'])) $cmd .= " -o User=" . escapeshellarg($options['username']);
         if (!empty($options['port']))     $cmd .= " -o Port=" . intval($options['port']);
         return $cmd;
