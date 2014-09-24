@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"regexp"
 )
 
 type (
@@ -319,7 +320,31 @@ func parseConfig() {
 				serverSettings[generalKey] = generalValue
 			}
 		}
-		servers[key] = parseServerSettings(key, serverSettings)
+		putToServers(key, serverSettings)
+	}
+}
+
+// parse interval in server name recursively
+// e.x. host1-3 = host1, host2, host3
+func putToServers(key string, rawSettings map[string]string) {
+	var is_interval bool = false
+	re := regexp.MustCompile("(.*)(\\D+)(\\d+)-(\\d+)(.*)")
+	matches := re.FindStringSubmatch(key)
+	if matches != nil {
+		start, _ := strconv.Atoi(matches[3])
+		end, _ := strconv.Atoi(matches[4])
+		if start <= end {
+			for i := start; i <= end; i++ {
+				putToServers(matches[1] + matches[2] + strconv.Itoa(i) + matches[5], rawSettings)
+			}
+			is_interval = true
+		} else {
+			progressLn("Incorrect interval in server name: ", key)
+		}
+	}
+	if !is_interval {
+		// settings are parsed for each key to pass correct hostname
+		servers[key] = parseServerSettings(key, rawSettings)
 	}
 }
 
